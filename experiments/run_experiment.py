@@ -277,6 +277,11 @@ async def run_sweep(args) -> list[dict]:
               f"serving={serv_cfg['name']:<22}")
 
         logger = MetricsLogger(RESULTS_DIR, exp_id)
+        cell_wall_clock_s = 0.0
+        cell_prompt_tokens = 0
+        cell_completion_tokens = 0
+        cell_episodes = 0
+        cell_verified = 0
         for ep, task in enumerate(tasks):
             llm_client = make_llm_client(args.backend, serv_cfg, args.vllm_base_url)
             tools = make_tools(args.task_source, task)
@@ -300,7 +305,19 @@ async def run_sweep(args) -> list[dict]:
                     completed=ep_result.completed,
                     final_history_tokens=ep_result.final_history_tokens,
                     verified=ep_result.verified,
+                    total_prompt_tokens=ep_result.total_prompt_tokens,
+                    total_completion_tokens=ep_result.total_completion_tokens,
+                    wall_clock_s=ep_result.wall_clock_s,
+                    gpu_hourly_usd=args.gpu_hourly_usd,
+                    input_usd_per_mtok=args.input_usd_per_mtok,
+                    output_usd_per_mtok=args.output_usd_per_mtok,
                 )
+                cell_wall_clock_s += ep_result.wall_clock_s
+                cell_prompt_tokens += ep_result.total_prompt_tokens
+                cell_completion_tokens += ep_result.total_completion_tokens
+                cell_episodes += 1
+                if ep_result.verified is True:
+                    cell_verified += 1
             finally:
                 close = getattr(tools, "close", None)
                 if callable(close):
@@ -314,6 +331,23 @@ async def run_sweep(args) -> list[dict]:
             s["interaction_name"] = cell["interaction_name"]
         if "hypothesis" in cell:
             s["hypothesis"] = cell["hypothesis"]
+        # Per-cell cost rollup.
+        gpu_cost = cell_wall_clock_s * (args.gpu_hourly_usd / 3600.0)
+        api_equiv_cost = (
+            cell_prompt_tokens * args.input_usd_per_mtok +
+            cell_completion_tokens * args.output_usd_per_mtok
+        ) / 1_000_000.0
+        s["episodes"] = cell_episodes
+        s["verified_count"] = cell_verified
+        s["task_success_rate"] = (cell_verified / cell_episodes) if cell_episodes else None
+        s["cell_wall_clock_s"] = cell_wall_clock_s
+        s["cell_total_prompt_tokens"] = cell_prompt_tokens
+        s["cell_total_completion_tokens"] = cell_completion_tokens
+        s["cell_gpu_cost_usd"] = gpu_cost
+        s["cell_api_equiv_cost_usd"] = api_equiv_cost
+        s["cost_per_episode_usd"] = (gpu_cost / cell_episodes) if cell_episodes else None
+        s["cost_per_verified_task_usd"] = (
+            (gpu_cost / cell_verified) if cell_verified > 0 else None)
         summaries.append(s)
         print(f"  turns={s['n_turns']:3d} "
               f"avg_ttft={s['avg_ttft_ms']:7.1f}ms "
@@ -321,6 +355,11 @@ async def run_sweep(args) -> list[dict]:
               f"avg_ctx_toks={s['avg_context_tokens']:6.0f} "
               f"compression={s['compression_ratio']:.2f} "
               f"cache_hit={(s.get('avg_cache_hit_rate') or 0):.2f}")
+        print(f"  episodes={cell_episodes} verified={cell_verified} "
+              f"wall={cell_wall_clock_s:.1f}s "
+              f"in_toks={cell_prompt_tokens} out_toks={cell_completion_tokens} "
+              f"gpu_cost=${gpu_cost:.4f} api_equiv=${api_equiv_cost:.4f} "
+              f"cost/task=${(gpu_cost/cell_episodes if cell_episodes else 0):.4f}")
 
     summary_path = RESULTS_DIR / f"sweep{sweep_id}_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -394,6 +433,13 @@ def main():
     p.add_argument("--task-id", default=None,
                    help="Single SWE-bench instance_id; overrides --task-limit.")
     p.add_argument("--max-turns", type=int, default=20)
+    # Cost accounting (per episode JSONL gets gpu_cost_usd + api_equiv_cost_usd).
+    p.add_argument("--gpu-hourly-usd", type=float, default=1.40,
+                   help="Rental cost of the GPU $/hr. Default 1.40 (A100 PCIe community).")
+    p.add_argument("--input-usd-per-mtok", type=float, default=0.15,
+                   help="Hosted-API equivalent input token cost in $ per 1M tokens.")
+    p.add_argument("--output-usd-per-mtok", type=float, default=0.60,
+                   help="Hosted-API equivalent output token cost in $ per 1M tokens.")
     args = p.parse_args()
     asyncio.run(run_sweep(args))
 

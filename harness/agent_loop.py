@@ -60,6 +60,10 @@ class EpisodeResult:
     # against the agent's patch; None for mock tasks or when evaluation
     # was skipped.
     verified: Optional[bool] = None
+    # Cost accounting per episode.
+    total_prompt_tokens: int = 0       # sum of prompt_tokens across all turns
+    total_completion_tokens: int = 0   # sum of completion_tokens across all turns
+    wall_clock_s: float = 0.0          # episode duration from first turn to terminal
 
 
 def _format_observation(obs: Observation) -> Message:
@@ -120,6 +124,9 @@ async def run_episode(
 
     completed = False
     last_finish_reason = None
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    t_episode_start = asyncio.get_running_loop().time()
 
     for turn in range(1, max_turns + 1):
         assembled = assemble(strategy, history, params,
@@ -145,6 +152,8 @@ async def run_episode(
             cache_hit_tokens=result.cache_hit_tokens,
             finish_reason=result.finish_reason,
         ))
+        total_prompt_tokens += result.prompt_tokens
+        total_completion_tokens += result.completion_tokens
 
         last_finish_reason = result.finish_reason
         history.append(_format_assistant(result.content))
@@ -180,6 +189,8 @@ async def run_episode(
                 print(f"[evaluate_patch failed for {task.task_id}: {e}]")
                 verified = None
 
+    wall_clock_s = asyncio.get_running_loop().time() - t_episode_start
+
     return EpisodeResult(
         task_id=task.task_id,
         n_turns=turn,
@@ -187,6 +198,9 @@ async def run_episode(
         final_history_tokens=messages_tokens(history),
         summary=metrics_logger.summary(),
         verified=verified,
+        total_prompt_tokens=total_prompt_tokens,
+        total_completion_tokens=total_completion_tokens,
+        wall_clock_s=wall_clock_s,
     )
 
 

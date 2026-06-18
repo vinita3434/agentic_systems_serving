@@ -64,11 +64,35 @@ class MetricsLogger:
                     orchestration: str, serving: str,
                     n_turns: int, completed: bool,
                     final_history_tokens: int,
-                    verified: Optional[bool]) -> None:
-        """Per-episode summary row. Separate file from turn-level JSONL so
-        analysis code doesn't have to mix granularities. `verified` is
-        True/False from the SWE-bench evaluator, or None for mock /
-        skipped / failed-evaluation episodes."""
+                    verified: Optional[bool],
+                    total_prompt_tokens: int = 0,
+                    total_completion_tokens: int = 0,
+                    wall_clock_s: float = 0.0,
+                    gpu_hourly_usd: float = 1.40,
+                    input_usd_per_mtok: float = 0.15,
+                    output_usd_per_mtok: float = 0.60) -> None:
+        """Per-episode summary row.
+
+        Cost accounting per episode:
+          - gpu_cost_usd       = wall_clock_s * (gpu_hourly_usd / 3600)
+                                 The actual rental cost for this episode on
+                                 the configured GPU. Self-hosted ground truth.
+          - api_equiv_cost_usd = (in_tok * in_rate + out_tok * out_rate) / 1e6
+                                 What the same token volume would cost on a
+                                 hosted API at the configured per-token rates.
+                                 Useful for comparing self-host vs hosted.
+          - total_cost_usd     = gpu_cost_usd  (headline; default GPU-based)
+
+        Defaults assume A100 80GB PCIe (RunPod community ~$1.40/hr) and
+        Qwen-class hosted-token rates. Override via run_experiment.py
+        CLI flags --gpu-hourly-usd / --input-usd-per-mtok / --output-usd-per-mtok.
+        """
+        gpu_cost_usd = wall_clock_s * (gpu_hourly_usd / 3600.0)
+        api_equiv_cost_usd = (
+            total_prompt_tokens * input_usd_per_mtok +
+            total_completion_tokens * output_usd_per_mtok
+        ) / 1_000_000.0
+
         row = {
             "experiment_id": self.experiment_id,
             "orchestration": orchestration,
@@ -79,6 +103,15 @@ class MetricsLogger:
             "completed": completed,
             "final_history_tokens": final_history_tokens,
             "verified": verified,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_completion_tokens": total_completion_tokens,
+            "wall_clock_s": wall_clock_s,
+            "gpu_hourly_usd": gpu_hourly_usd,
+            "input_usd_per_mtok": input_usd_per_mtok,
+            "output_usd_per_mtok": output_usd_per_mtok,
+            "gpu_cost_usd": gpu_cost_usd,
+            "api_equiv_cost_usd": api_equiv_cost_usd,
+            "total_cost_usd": gpu_cost_usd,
             "timestamp": time.time(),
         }
         with self.episode_log_path.open("a") as f:
