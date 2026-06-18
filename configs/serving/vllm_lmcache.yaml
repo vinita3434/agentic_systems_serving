@@ -1,0 +1,25 @@
+name: vllm_lmcache
+engine: vllm
+description: |
+  vLLM + LMCache CPU offload. When GPU KV blocks fill under pressure,
+  evicted entries spill to CPU memory via the LMCacheConnectorV1 KV
+  transfer hook rather than being discarded. Tests the production-
+  realistic tiered cache pattern: does CPU swap recover most of the
+  win that aggressive eviction would otherwise destroy?
+gpu_classes: [A100, H100]
+model: Qwen/Qwen2.5-Coder-7B-Instruct
+host: 0.0.0.0
+port: 8000
+flags:
+  enable_prefix_caching: true
+  enable_chunked_prefill: true
+  dtype: bfloat16
+  gpu_memory_utilization: 0.90
+  max_model_len: 32768
+  max_num_batched_tokens: 2048
+  max_num_seqs: 64
+extra_args:
+  - "--enable-auto-tool-choice"
+  - "--tool-call-parser=hermes"
+  - "--kv-transfer-config"
+  - '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'

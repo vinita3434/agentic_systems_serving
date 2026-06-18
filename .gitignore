@@ -1,0 +1,24 @@
+# Sweep outputs
+experiments/results/*.jsonl
+experiments/results/*.json
+!experiments/results/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Local credentials / secrets — never commit
+.env
+.envrc
+*.token

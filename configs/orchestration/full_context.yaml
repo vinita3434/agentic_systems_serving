@@ -1,0 +1,7 @@
+name: full_context
+strategy: full_context
+description: |
+  Naive baseline. Every turn and observation is kept verbatim in the
+  message history. Establishes the upper bound for context size and TTFT
+  growth across a SWE-agent episode.
+params: {}

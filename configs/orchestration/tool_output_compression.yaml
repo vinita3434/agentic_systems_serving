@@ -1,0 +1,13 @@
+name: tool_output_compression
+strategy: tool_output_compression
+description: |
+  Truncates long bash / file-read observations before they enter the
+  history. Keeps the first and last N lines plus any stderr; drops the
+  middle. Targets the most common context-bloat source in SWE-agent runs
+  (multi-thousand-line directory listings, full file dumps, test logs).
+params:
+  max_observation_chars: 2000
+  keep_first_lines: 20
+  keep_last_lines: 20
+  preserve_stderr: true
+  compress_on_append: true  # if false, compress lazily at assemble time

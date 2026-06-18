@@ -1,0 +1,24 @@
+name: vllm_continuum
+engine: vllm-continuum
+description: |
+  vLLM Continuum fork (https://github.com/Hanchenli/vllm-continuum).
+  Adds workflow / tool awareness on top of vanilla vLLM: KV blocks
+  associated with tool outputs get TTL-based retention rather than
+  pure LRU. The workflow-aware serving condition; tests whether
+  knowing about the agent loop changes serving behavior in a
+  measurable way relative to vllm_lru.
+gpu_classes: [A100, H100]
+model: Qwen/Qwen2.5-Coder-7B-Instruct
+host: 0.0.0.0
+port: 8000
+flags:
+  enable_prefix_caching: true
+  enable_chunked_prefill: true
+  dtype: bfloat16
+  gpu_memory_utilization: 0.90
+  max_model_len: 32768
+  max_num_batched_tokens: 2048
+  max_num_seqs: 64
+extra_args:
+  - "--enable-auto-tool-choice"
+  - "--tool-call-parser=hermes"

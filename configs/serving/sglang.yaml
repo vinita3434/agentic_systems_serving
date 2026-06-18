@@ -1,0 +1,19 @@
+name: sglang
+engine: sglang
+description: |
+  SGLang with RadixAttention (default in SGLang). Alternative engine,
+  different cache structure: prefix sharing via a radix tree rather than
+  vLLM's hash-block LRU. The strongest workflow-blind condition — the
+  serving layer is sophisticated, but unaware of agent workflow
+  semantics. Tests whether radix-style sharing captures the same wins
+  as vLLM's prefix cache on this workload.
+gpu_classes: [A100, H100]
+model: Qwen/Qwen2.5-Coder-7B-Instruct
+host: 0.0.0.0
+port: 30000   # SGLang default
+flags:
+  mem_fraction_static: 0.90
+  context_length: 32768
+  chunked_prefill_size: 2048
+  tool_call_parser: hermes
+extra_args: []

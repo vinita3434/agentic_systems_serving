@@ -1,0 +1,22 @@
+name: vllm_lru
+engine: vllm
+description: |
+  vLLM with default prefix caching enabled (hash-block LRU eviction).
+  The standard production baseline. All orchestration sub-axis sweeps
+  are anchored on this serving config, so each orchestration variation
+  is compared against a sensible production-quality serving setup.
+gpu_classes: [A100, H100]
+model: Qwen/Qwen2.5-Coder-7B-Instruct
+host: 0.0.0.0
+port: 8000
+flags:
+  enable_prefix_caching: true
+  enable_chunked_prefill: true
+  dtype: bfloat16
+  gpu_memory_utilization: 0.90
+  max_model_len: 32768
+  max_num_batched_tokens: 2048
+  max_num_seqs: 64
+extra_args:
+  - "--enable-auto-tool-choice"
+  - "--tool-call-parser=hermes"

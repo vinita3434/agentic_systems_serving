@@ -1,0 +1,109 @@
+# Experimental design for the three-layer study.
+#
+# Layer 1 — serving_sweep
+#     Vary the serving config; hold orchestration at the "production-quality"
+#     prefix-friendly anchor (cache_aware_ordering). Tells you what each
+#     serving engine / cache policy is worth when orchestration already
+#     does its best to preserve prefixes.
+#
+# Layer 2 — three orchestration sub-axis sweeps
+#     Each sub-axis varies ONE orchestration dimension, holding serving at
+#     the standard prefix-caching baseline (vllm_lru). Each variation is
+#     compared against the joint (full_context, vllm_lru) origin which is
+#     re-measured per sweep.
+#
+#     context_mgmt_sweep    — vary {full / sliding / summary} of history
+#     prompt_assembly_sweep — vary {chronological / cache-aware} ordering
+#     tool_output_sweep     — vary {raw / compressed} tool outputs
+#
+# Layer 3 — interactions
+#     Only the named hypothesis cells listed below. Each one completes a
+#     2x2 against marginals already measured in Layer 1 and Layer 2; the
+#     test cell is the single novel combination.
+#
+# Design modes available in run_experiment.py:
+#     grid, ofat, ofat+interactions   (legacy; use the `baseline:` field)
+#     serving_sweep                   (uses serving_sweep_anchor)
+#     context_mgmt_sweep              (uses orchestration_sweep_anchor + axis)
+#     prompt_assembly_sweep           (uses orchestration_sweep_anchor + axis)
+#     tool_output_sweep               (uses orchestration_sweep_anchor + axis)
+#     interactions                    (uses the `interactions:` list ONLY)
+
+baseline:
+  # Legacy anchor for grid / ofat / ofat+interactions modes.
+  # Updated from old serving=baseline (deleted) to vllm_lru.
+  orchestration: full_context
+  serving: vllm_lru
+
+# L1 anchor: orchestration held here while serving varies.
+serving_sweep_anchor:
+  orchestration: cache_aware_ordering
+
+# L2 anchor: serving held here while one orchestration axis varies.
+orchestration_sweep_anchor:
+  serving: vllm_lru
+
+# Which existing orchestration strategy belongs to which sub-axis.
+# Each sub-axis sweep emits one cell per name listed here, paired with
+# the L2 serving anchor. The (full_context, vllm_lru) origin appears in
+# every sub-axis sweep as the joint baseline (re-measurement is intentional).
+orchestration_axes:
+  context_mgmt:    [full_context, sliding_window, summarization]
+  prompt_assembly: [full_context, cache_aware_ordering]
+  tool_output:     [full_context, tool_output_compression]
+
+# L3 interactions. Each cell is the ONE novel combination needed to
+# complete a 2x2 whose other three corners come from L1 and L2 sweeps.
+interactions:
+  - name: H1_summarization_kills_continuum
+    orchestration: summarization
+    serving: vllm_continuum
+    hypothesis: |
+      Summarization rewrites prefix bytes mid-episode. Continuum's
+      tool-aware KV TTL depends on prefix stability across turns.
+      Expected: Continuum's serving-side win (visible in L1) evaporates
+      when paired with summarization.
+    comparison_baselines:
+      - "(cache_aware_ordering, vllm_continuum)  # from serving_sweep"
+      - "(summarization, vllm_lru)               # from context_mgmt_sweep"
+
+  - name: H2_sliding_window_kills_radix
+    orchestration: sliding_window
+    serving: sglang
+    hypothesis: |
+      Sliding window drops the early turns that anchor a stable shared
+      prefix across calls. SGLang's RadixAttention shares precisely
+      those branches. Expected: RadixAttention's advantage collapses
+      when the orchestration deliberately discards old context.
+    comparison_baselines:
+      - "(cache_aware_ordering, sglang)          # from serving_sweep"
+      - "(sliding_window, vllm_lru)              # from context_mgmt_sweep"
+
+  - name: H3_compression_breaks_lmcache
+    orchestration: tool_output_compression
+    serving: vllm_lmcache
+    hypothesis: |
+      Tool output compression rewrites observation bytes. LMCache reloads
+      KV blocks from CPU keyed on prefix hash; the rewritten bytes
+      produce a different hash, so the reload is a guaranteed miss.
+      Expected: LMCache's CPU-tier hits drop to ~0 under compression.
+    comparison_baselines:
+      - "(cache_aware_ordering, vllm_lmcache)    # from serving_sweep"
+      - "(tool_output_compression, vllm_lru)     # from tool_output_sweep"
+
+  - name: H4_continuum_independent_of_orchestration
+    orchestration: full_context
+    serving: vllm_continuum
+    hypothesis: |
+      Does Continuum's tool-aware KV management deliver any win when the
+      orchestration does NOT explicitly preserve prefixes? Under L1's
+      anchor (cache_aware_ordering), Continuum's win could be entirely
+      driven by orchestration. This cell adds the orchestration-naive
+      corner (full_context, vllm_continuum). If Continuum still helps,
+      the win is independent of orchestration; if not, the L1 advantage
+      is fully attributable to cache_aware_ordering. Completes the 2x2
+      with (cache_aware_ordering, vllm_continuum) and (full_context,
+      vllm_lru).
+    comparison_baselines:
+      - "(cache_aware_ordering, vllm_continuum)  # from serving_sweep"
+      - "(full_context, vllm_lru)                # from any L2 sub-sweep"

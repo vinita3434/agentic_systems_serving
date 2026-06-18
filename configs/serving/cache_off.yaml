@@ -1,0 +1,22 @@
+name: cache_off
+engine: vllm
+description: |
+  Cache OFF — the empirical floor. vLLM with prefix caching disabled.
+  Establishes what KV reuse across requests is actually worth in this
+  workload: every request prefills from scratch. Reference point for
+  measuring the absolute win of any caching condition.
+gpu_classes: [A100, H100]
+model: Qwen/Qwen2.5-Coder-7B-Instruct
+host: 0.0.0.0
+port: 8000
+flags:
+  enable_prefix_caching: false
+  enable_chunked_prefill: true
+  dtype: bfloat16
+  gpu_memory_utilization: 0.90
+  max_model_len: 32768
+  max_num_batched_tokens: 2048
+  max_num_seqs: 64
+extra_args:
+  - "--enable-auto-tool-choice"
+  - "--tool-call-parser=hermes"

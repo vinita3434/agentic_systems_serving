@@ -1,0 +1,12 @@
+name: summarization
+strategy: summarization
+description: |
+  When the message history exceeds a token threshold, collapse all turns
+  older than the recent window into a single summary message produced by
+  the LLM (same model in this harness). Preserves long-range information
+  density at the cost of an extra LLM call.
+params:
+  trigger_token_threshold: 8000
+  keep_recent_turns: 4
+  summary_target_tokens: 400
+  summary_model: same  # 'same' uses the experiment model; or set explicit name

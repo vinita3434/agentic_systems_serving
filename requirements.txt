@@ -1,0 +1,10 @@
+# Core harness requirements (mock mode runs with just these).
+httpx>=0.27.0
+pyyaml>=6.0
+tiktoken>=0.7.0
+
+# Real SWE-bench tasks (Phase 2). Pulled in by setup_runpod.sh on the pod.
+# Local installs are optional; uncomment if you want to develop SWE-bench
+# code paths on your laptop.
+# datasets>=2.20
+# sweagent>=1.0

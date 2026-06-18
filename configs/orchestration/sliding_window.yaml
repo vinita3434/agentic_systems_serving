@@ -1,0 +1,11 @@
+name: sliding_window
+strategy: sliding_window
+description: |
+  Keep only the most recent N turn-pairs (assistant + observation), plus
+  system prompt and the original task message. Cheap and predictable
+  context size, but old observations (initial file reads, error context)
+  are lost.
+params:
+  window_turns: 6
+  always_keep_system: true
+  always_keep_task: true

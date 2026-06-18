@@ -1,0 +1,16 @@
+name: cache_aware_ordering
+strategy: cache_aware_ordering
+description: |
+  Reorders the message list to maximize KV cache prefix hits across turns.
+  Layout:
+    [system prompt] [task] [stable file content] [volatile recent turns]
+  Stable segments (initial file reads, repo metadata) are pinned near the
+  front so the vLLM prefix cache can serve them across many turns. Only
+  the volatile tail changes each step.
+params:
+  volatile_window_turns: 4
+  stable_markers:
+    - "file:"
+    - "```"
+    - "<file>"
+  pin_initial_observations: 2  # treat first N observations as stable
