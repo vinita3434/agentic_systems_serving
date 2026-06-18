@@ -139,6 +139,11 @@ class VLLMClient:
         self.headers = {"Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json"}
         self.timeout = timeout
+        # Cumulative cache counters from previous /metrics scrape, used to
+        # compute per-request deltas (the cumulative rate is uninformative
+        # across many requests).
+        self._prev_queries: Optional[float] = None
+        self._prev_hits: Optional[float] = None
 
     async def chat(self, messages: list[Message],
                    max_tokens: int = 512,
@@ -205,17 +210,36 @@ class VLLMClient:
         )
 
     async def _fetch_cache_stats(self) -> tuple[Optional[int], Optional[float]]:
-        """vLLM exposes prefix-cache hit counters at /metrics (Prometheus).
-        We parse two counters: prefix_cache_queries and prefix_cache_hits."""
+        """Per-request prefix-cache hit stats, computed as the delta of
+        vLLM's cumulative counters since the previous chat call.
+
+        vLLM 0.6+ exposes Prometheus counters at /metrics:
+          - vllm:prefix_cache_queries_total  (queried prompt tokens)
+          - vllm:prefix_cache_hits_total     (served-from-cache tokens)
+
+        Both are cumulative. We snapshot them around each request and
+        return the delta so the metrics file shows per-call hit rate.
+        """
         try:
             metrics_url = self.base_url.replace("/v1", "") + "/metrics"
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(metrics_url)
                 resp.raise_for_status()
-            queries = _parse_prom(resp.text, "vllm:gpu_prefix_cache_queries")
-            hits = _parse_prom(resp.text, "vllm:gpu_prefix_cache_hits")
-            if queries and queries > 0:
-                return int(hits or 0), (hits or 0) / queries
+            queries = _parse_prom(resp.text, "vllm:prefix_cache_queries_total")
+            hits = _parse_prom(resp.text, "vllm:prefix_cache_hits_total")
+            if queries is None or hits is None:
+                return None, None
+
+            if self._prev_queries is None:
+                delta_q, delta_h = queries, hits
+            else:
+                delta_q = max(0.0, queries - self._prev_queries)
+                delta_h = max(0.0, hits - self._prev_hits)
+
+            self._prev_queries, self._prev_hits = queries, hits
+
+            if delta_q > 0:
+                return int(delta_h), delta_h / delta_q
         except Exception:
             pass
         return None, None
