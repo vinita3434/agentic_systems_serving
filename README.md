@@ -152,13 +152,38 @@ does not stall the async LLM client.
 
 ### Sweep runner (`experiments/run_experiment.py`)
 
-CLI flags:
+Two ways to choose cells:
+
+- **`--layer {serving, orchestration, interactions, custom}`** — the
+  modular, compartmentalized interface (preferred). Each layer runs in
+  isolation; `--serving` / `--orchestration` (each accept multiple names),
+  `--axis`, and `--interaction` filter or override what varies. When set,
+  `--layer` overrides `--design`. Examples:
+  - `--layer serving --serving vllm_lru` — one serving cell.
+  - `--layer orchestration --serving vllm_lru` — all orchestrations against
+    one engine (the per-engine sweep used on RunPod).
+  - `--layer orchestration --axis context_mgmt` — one orchestration sub-axis.
+  - `--layer interactions --interaction H1 H3` — named hypotheses only.
+  - `--layer custom --serving sglang --orchestration full_context` — any
+    single arbitrary cell.
+- **`--design <mode>`** — legacy preset bundles (see §4); default
+  `ofat+interactions`. Kept for backward compatibility.
+
+Other flags:
 - `--backend {mock, vllm}` — `mock` is GPU-free; `vllm` hits a real
   server (any OpenAI-compatible engine).
 - `--task-source {mock, swebench} --swebench-split {full, lite, verified} --task-limit N --task-id ID`.
 - `--gpu-class {A100, H100}` — filters serving configs via the
   `gpu_classes` field in each YAML.
-- `--design <mode>` — see §4.
+- `--vllm-base-url URL` — optional override. By default the server URL is
+  **derived from each serving config's `port`** (each engine binds a
+  distinct port: cache_off=8000, vllm_lru=8001, vllm_lmcache=8002,
+  vllm_continuum=8003, sglang=30000), so `--serving <name>` automatically
+  targets the right server.
+- `--skip-serving-check` — skip the startup preflight (see §5) that
+  confirms the running engine matches the requested `--serving` config.
+
+Operational runbook for real RunPod runs: see `RUNBOOK.md`.
 
 ---
 
@@ -208,7 +233,10 @@ named question, vs 25 for a brute-force grid.
 |---|---|
 | Custom agent loop | ✅ End-to-end working |
 | 5 orchestration strategies | ✅ Implemented + validated in mock |
-| 5 serving configs (cache-focused) | ✅ YAMLs + engine-dispatch launcher |
+| 5 serving configs (cache-focused) | ✅ YAMLs + engine-dispatch launcher; distinct port per config |
+| Modular `--layer` interface (serving / orchestration / interactions / custom) | ✅ Compartmentalized run selection + per-config filtering |
+| Auto-derived server URL from serving config port | ✅ `--serving <name>` targets the right port; `--vllm-base-url` is an override |
+| Engine preflight check | ✅ Pings `/v1/models` + fingerprints engine family at startup; warns on mismatch, reminds to confirm continuum env |
 | 5 layered design modes + 3 legacy modes | ✅ All 8 validated in mock |
 | Per-turn metrics (TTFT, latency, tokens, cache hits) | ✅ JSONL |
 | Per-episode metrics (`verified` field) | ✅ JSONL — populates `null` in mock; calls SWE-bench evaluator in real runs |

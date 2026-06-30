@@ -10,7 +10,7 @@ description: |
 gpu_classes: [A100, H100]
 model: Qwen/Qwen2.5-Coder-7B-Instruct
 host: 0.0.0.0
-port: 8000
+port: 8003
 flags:
   enable_prefix_caching: true
   enable_chunked_prefill: true

@@ -1,7 +1,39 @@
 """
 Sweep runner.
 
-Selects which (orchestration, serving) cells to run via --design:
+Two ways to choose which (orchestration, serving) cells to run:
+
+(A) MODULAR — `--layer`, the compartmentalized interface (preferred).
+    When `--layer` is given it overrides `--design`. Each layer runs in
+    isolation; filter flags select exactly what varies.
+
+      --layer serving         Vary serving; hold orchestration at the L1
+                              anchor (serving_sweep_anchor). Filter with
+                              --serving NAME [NAME...]; override the held
+                              orchestration with a single --orchestration NAME.
+      --layer orchestration   Vary orchestration; hold serving at the L2
+                              anchor (orchestration_sweep_anchor). Pick a
+                              sub-axis with --axis, or specific configs with
+                              --orchestration NAME [NAME...]; override the held
+                              serving with a single --serving NAME.
+      --layer interactions    Run the named H1-H4 hypothesis cells only.
+                              Filter with --interaction H1 [H2...].
+      --layer custom          Arbitrary cross-product of --serving x
+                              --orchestration (each defaults to ALL if omitted).
+                              Use this to run any single cell.
+
+    Examples:
+      # Only the vllm_lru serving config, at the serving anchor orchestration
+      python experiments/run_experiment.py --layer serving --serving vllm_lru
+      # Only the context-management orchestration sub-axis
+      python experiments/run_experiment.py --layer orchestration --axis context_mgmt
+      # One exact cell
+      python experiments/run_experiment.py --layer custom \\
+          --orchestration summarization --serving vllm_continuum
+      # Just hypothesis H1 and H3
+      python experiments/run_experiment.py --layer interactions --interaction H1 H3
+
+(B) LEGACY — `--design`, the preset bundles (kept for backward compat):
 
   grid               every pair  (5x4 = 20 cells)
   ofat               baseline + orchestration main effects + serving main effects
@@ -46,7 +78,7 @@ from pathlib import Path
 import yaml
 
 from harness.agent_loop import DEFAULT_MOCK_TASK, Task, run_episode
-from harness.llm_client import MockLLMClient, VLLMClient
+from harness.llm_client import MockLLMClient, VLLMClient, preflight_serving_check
 from harness.metrics_logger import MetricsLogger
 from harness.tools import MockTools
 
@@ -195,6 +227,108 @@ def select_cells(orch: dict[str, dict], serving: dict[str, dict],
     raise ValueError(f"Unknown design mode: {design}")
 
 
+# ---------- modular cell selection (--layer) -------------------------------
+
+
+def _interaction_matches(name: str | None, wanted: set[str]) -> bool:
+    """Match an interaction entry by full name or short token (e.g. 'H1')."""
+    if name is None:
+        return False
+    if name in wanted:
+        return True
+    token = name.split("_", 1)[0]  # 'H1_summarization_...' -> 'H1'
+    return token in wanted
+
+
+def select_cells_modular(orch: dict[str, dict], serving: dict[str, dict],
+                         interactions_cfg: dict, args) -> list[dict]:
+    """Compartmentalized selection. Each --layer runs in isolation.
+
+    Filter flags:
+      --serving / --orchestration : restrict which configs participate.
+          In a sweep layer the flag for the *varying* axis filters the
+          sweep; a single value for the *held* axis overrides its anchor.
+      --axis        : in the orchestration layer, pick one sub-axis.
+      --interaction : in the interactions layer, pick named hypotheses.
+    """
+    layer = args.layer
+    serving_filter = args.serving            # list[str] | None
+    orch_filter = args.orchestration         # list[str] | None
+
+    if layer == "serving":
+        anchor_name = (orch_filter[0] if orch_filter
+                       else interactions_cfg["serving_sweep_anchor"]["orchestration"])
+        anchor_orch = _require(orch, anchor_name, "serving-layer held orchestration")
+        serv_names = serving_filter if serving_filter else list(serving)
+        return [
+            {"orchestration": anchor_orch,
+             "serving": _require(serving, sn, "serving"),
+             "role": "serving_sweep"}
+            for sn in serv_names
+        ]
+
+    if layer == "orchestration":
+        anchor_name = (serving_filter[0] if serving_filter
+                       else interactions_cfg["orchestration_sweep_anchor"]["serving"])
+        anchor_serv = _require(serving, anchor_name, "orchestration-layer held serving")
+        if orch_filter:
+            orch_names = orch_filter
+            role = "orchestration_sweep"
+        elif args.axis:
+            axes = interactions_cfg.get("orchestration_axes") or {}
+            orch_names = axes.get(args.axis)
+            if not orch_names:
+                raise ValueError(f"orchestration_axes.{args.axis} missing or empty "
+                                 f"in interactions.yaml")
+            role = f"{args.axis}_sweep"
+        else:
+            orch_names = list(orch)          # full orchestration layer
+            role = "orchestration_sweep"
+        return [
+            {"orchestration": _require(orch, on, "orchestration"),
+             "serving": anchor_serv,
+             "role": role}
+            for on in orch_names
+        ]
+
+    if layer == "interactions":
+        wanted = set(args.interaction) if args.interaction else None
+        out: list[dict] = []
+        for entry in interactions_cfg.get("interactions") or []:
+            name = entry.get("name")
+            if wanted is not None and not _interaction_matches(name, wanted):
+                continue
+            o_name, s_name = entry["orchestration"], entry["serving"]
+            if o_name not in orch or s_name not in serving:
+                continue
+            out.append({
+                "orchestration": orch[o_name],
+                "serving": serving[s_name],
+                "role": "interaction",
+                "interaction_name": name,
+                "hypothesis": entry.get("hypothesis"),
+                "comparison_baselines": entry.get("comparison_baselines"),
+            })
+        if wanted is not None and not out:
+            raise ValueError(f"No interactions matched {sorted(wanted)}. "
+                             f"Available: "
+                             f"{[e.get('name') for e in interactions_cfg.get('interactions') or []]}")
+        return out
+
+    if layer == "custom":
+        orch_names = orch_filter if orch_filter else list(orch)
+        serv_names = serving_filter if serving_filter else list(serving)
+        return [
+            {"orchestration": _require(orch, on, "orchestration"),
+             "serving": _require(serving, sn, "serving"),
+             "role": "custom"}
+            for on in orch_names
+            for sn in serv_names
+        ]
+
+    raise ValueError(f"Unknown layer: {layer}")
+
+
 # ---------- task selection -------------------------------------------------
 
 
@@ -231,6 +365,22 @@ def make_tools(task_source: str, task: Task):
 # ---------- LLM client factory ---------------------------------------------
 
 
+def serving_base_url(serving_cfg: dict, override: str | None) -> str:
+    """Where the harness should send requests for this serving config.
+
+    Default: derive from the config's own `port` (each engine binds a
+    distinct port, so picking --serving automatically targets the right
+    server). `--vllm-base-url` overrides this when explicitly passed.
+
+    Note: we always connect to localhost — the config's `host` (0.0.0.0)
+    is the server's *bind* address, not a client connect address.
+    """
+    if override:
+        return override
+    port = serving_cfg.get("port", 8000)
+    return f"http://localhost:{port}/v1"
+
+
 def make_llm_client(backend: str, serving_cfg: dict, vllm_base_url: str):
     if backend == "mock":
         return MockLLMClient(model="mock-qwen2.5-coder-7b")
@@ -249,7 +399,13 @@ async def run_sweep(args) -> list[dict]:
     serving_configs = filter_by_gpu_class(load_configs("serving"), args.gpu_class)
     interactions_cfg = load_interactions()
 
-    cells = select_cells(orch_configs, serving_configs, interactions_cfg, args.design)
+    if args.layer:
+        cells = select_cells_modular(orch_configs, serving_configs,
+                                     interactions_cfg, args)
+        design_label = f"layer:{args.layer}"
+    else:
+        cells = select_cells(orch_configs, serving_configs, interactions_cfg, args.design)
+        design_label = args.design
     tasks = load_tasks(args.task_source, args.swebench_split,
                        args.task_limit, args.task_id)
 
@@ -258,7 +414,7 @@ async def run_sweep(args) -> list[dict]:
 
     print(f"Sweep id:      {sweep_id}")
     print(f"Backend:       {args.backend}")
-    print(f"Design:        {args.design}")
+    print(f"Design:        {design_label}")
     print(f"GPU class:     {args.gpu_class}")
     print(f"Task source:   {args.task_source} (n={len(tasks)})")
     print(f"Orchestrations: {list(orch_configs)}")
@@ -266,6 +422,23 @@ async def run_sweep(args) -> list[dict]:
     print(f"Cells:          {len(cells)} "
           f"(grid would be {len(orch_configs) * len(serving_configs)})")
     print()
+
+    # Preflight: confirm the running engine matches each serving config we're
+    # about to hit. Only meaningful against a real server (--backend vllm).
+    if args.backend == "vllm" and not args.skip_serving_check:
+        seen_serv: dict[str, dict] = {}
+        for cell in cells:
+            seen_serv.setdefault(cell["serving"]["name"], cell["serving"])
+        for name, serv_cfg in seen_serv.items():
+            base_url = serving_base_url(serv_cfg, args.vllm_base_url)
+            warns = await preflight_serving_check(base_url, serv_cfg)
+            if warns:
+                print(f"  [serving check: {name} @ {base_url}]")
+                for w in warns:
+                    print(f"    ⚠  {w}")
+            else:
+                print(f"  [serving check: {name} @ {base_url}] ok")
+        print()
 
     for cell in cells:
         orch_cfg = cell["orchestration"]
@@ -283,7 +456,8 @@ async def run_sweep(args) -> list[dict]:
         cell_episodes = 0
         cell_verified = 0
         for ep, task in enumerate(tasks):
-            llm_client = make_llm_client(args.backend, serv_cfg, args.vllm_base_url)
+            base_url = serving_base_url(serv_cfg, args.vllm_base_url)
+            llm_client = make_llm_client(args.backend, serv_cfg, base_url)
             tools = make_tools(args.task_source, task)
             try:
                 ep_result = await run_episode(
@@ -366,7 +540,7 @@ async def run_sweep(args) -> list[dict]:
     with summary_path.open("w") as f:
         json.dump({
             "sweep_id": sweep_id,
-            "design": args.design,
+            "design": design_label,
             "backend": args.backend,
             "gpu_class": args.gpu_class,
             "task_source": args.task_source,
@@ -388,10 +562,12 @@ _ROLE_ORDER = {
     "context_mgmt_sweep": 2,
     "prompt_assembly_sweep": 3,
     "tool_output_sweep": 4,
-    "main_effect_orch": 5,
-    "main_effect_serving": 6,
-    "interaction": 7,
-    "grid": 8,
+    "orchestration_sweep": 5,
+    "main_effect_orch": 6,
+    "main_effect_serving": 7,
+    "interaction": 8,
+    "custom": 9,
+    "grid": 10,
 }
 
 
@@ -414,7 +590,9 @@ def _print_table(summaries: list[dict]) -> None:
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--backend", choices=["mock", "vllm"], default="mock")
-    p.add_argument("--vllm-base-url", default="http://localhost:8000/v1")
+    p.add_argument("--vllm-base-url", default=None,
+                   help="Override the server URL. Default: derived from the "
+                        "serving config's port (http://localhost:<port>/v1).")
     p.add_argument("--design",
                    choices=["grid", "ofat", "ofat+interactions",
                             "serving_sweep",
@@ -422,7 +600,28 @@ def main():
                             "prompt_assembly_sweep",
                             "tool_output_sweep",
                             "interactions"],
-                   default="ofat+interactions")
+                   default="ofat+interactions",
+                   help="Legacy preset bundles. Ignored when --layer is set.")
+    # Modular compartmentalized interface. When set, overrides --design.
+    p.add_argument("--layer",
+                   choices=["serving", "orchestration", "interactions", "custom"],
+                   default=None,
+                   help="Run one compartment in isolation. Overrides --design.")
+    p.add_argument("--serving", nargs="+", default=None,
+                   help="Restrict serving config(s) by name. In --layer serving "
+                        "these are the cells swept; elsewhere a single name "
+                        "overrides the held serving anchor.")
+    p.add_argument("--orchestration", nargs="+", default=None,
+                   help="Restrict orchestration config(s) by name. In --layer "
+                        "orchestration these are the cells swept; elsewhere a "
+                        "single name overrides the held orchestration anchor.")
+    p.add_argument("--axis",
+                   choices=["context_mgmt", "prompt_assembly", "tool_output"],
+                   default=None,
+                   help="In --layer orchestration, sweep just this sub-axis.")
+    p.add_argument("--interaction", nargs="+", default=None,
+                   help="In --layer interactions, run only these hypotheses "
+                        "(full name or short token like H1).")
     p.add_argument("--gpu-class", choices=["A100", "H100"], default="A100",
                    help="Filter serving configs incompatible with this GPU class.")
     p.add_argument("--task-source", choices=["mock", "swebench"], default="mock")
@@ -433,6 +632,9 @@ def main():
     p.add_argument("--task-id", default=None,
                    help="Single SWE-bench instance_id; overrides --task-limit.")
     p.add_argument("--max-turns", type=int, default=20)
+    p.add_argument("--skip-serving-check", action="store_true",
+                   help="Skip the startup check that the running engine "
+                        "matches the --serving config (vllm backend only).")
     # Cost accounting (per episode JSONL gets gpu_cost_usd + api_equiv_cost_usd).
     p.add_argument("--gpu-hourly-usd", type=float, default=1.40,
                    help="Rental cost of the GPU $/hr. Default 1.40 (A100 PCIe community).")

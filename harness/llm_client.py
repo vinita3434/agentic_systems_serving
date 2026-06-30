@@ -245,6 +245,87 @@ class VLLMClient:
         return None, None
 
 
+async def preflight_serving_check(base_url: str, serving_cfg: dict,
+                                  timeout: float = 5.0) -> list[str]:
+    """Sanity-check that the server at base_url plausibly matches the
+    serving config we were asked to run. Returns a list of human-readable
+    warnings (empty == everything checks out).
+
+    What it can verify:
+      * server is reachable                         (hard error if not)
+      * served model id matches serving_cfg.model    (warn on mismatch)
+      * engine family: sglang vs vllm-family         (warn on mismatch)
+
+    What it CANNOT verify reliably: vanilla vLLM vs the vllm-continuum fork
+    — both speak the identical OpenAI API and expose `vllm:`-prefixed
+    metrics. For the continuum config we emit an explicit reminder to
+    confirm the running env, since a silent fallback to vanilla vLLM is
+    exactly the failure mode this check exists to surface.
+    """
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-len("/v1")]
+    v1 = root + "/v1"
+
+    expected_engine = serving_cfg.get("engine", "vllm")
+    expected_family = "sglang" if expected_engine == "sglang" else "vllm"
+    expected_model = serving_cfg.get("model")
+    warnings: list[str] = []
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # 1. Reachability + served model id.
+        try:
+            resp = await client.get(f"{v1}/models")
+            resp.raise_for_status()
+        except Exception as e:
+            raise ConnectionError(
+                f"serving preflight: no reachable server at {v1} ({e}). "
+                f"Start it with ./serving/start_vllm.sh "
+                f"{serving_cfg.get('name', '<config>')} before running "
+                f"--backend vllm.") from e
+
+        try:
+            served = [m.get("id") for m in (resp.json().get("data") or [])]
+        except Exception:
+            served = []
+        if expected_model and served and expected_model not in served:
+            warnings.append(
+                f"served model {served} != config model '{expected_model}'.")
+
+        # 2. Engine family fingerprint.
+        running_family = "unknown"
+        try:
+            info = await client.get(f"{root}/get_model_info")
+            if info.status_code == 200:
+                running_family = "sglang"
+        except Exception:
+            pass
+        if running_family == "unknown":
+            try:
+                metrics = await client.get(f"{root}/metrics")
+                if metrics.status_code == 200 and "vllm:" in metrics.text:
+                    running_family = "vllm"
+            except Exception:
+                pass
+
+        if running_family != "unknown" and running_family != expected_family:
+            warnings.append(
+                f"config '{serving_cfg.get('name')}' expects a "
+                f"{expected_family}-family engine but the running server "
+                f"fingerprints as '{running_family}'. You are likely measuring "
+                f"the wrong engine.")
+
+        # 3. Continuum cannot be distinguished from vanilla vLLM via the API.
+        if expected_engine == "vllm-continuum":
+            warnings.append(
+                "config expects the vllm-continuum fork, which is "
+                "API-indistinguishable from vanilla vLLM. Confirm the server "
+                "was started from the continuum env (`which vllm` -> fork "
+                "checkout); otherwise this run silently measures vanilla vLLM.")
+
+    return warnings
+
+
 def _parse_prom(text: str, metric: str) -> Optional[float]:
     for line in text.splitlines():
         if line.startswith(metric):
