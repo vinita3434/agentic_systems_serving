@@ -637,7 +637,7 @@ def main():
                         "matches the --serving config (vllm backend only).")
     # Cost accounting (per episode JSONL gets gpu_cost_usd + api_equiv_cost_usd).
     p.add_argument("--gpu-hourly-usd", type=float, default=1.40,
-                   help="Rental cost of the GPU $/hr. Default 1.40 (A100 PCIe community).")
+                   help="Rental cost of the GPU $/hr. Default 1.40 (A100 SXM, RunPod).")
     p.add_argument("--input-usd-per-mtok", type=float, default=0.15,
                    help="Hosted-API equivalent input token cost in $ per 1M tokens.")
     p.add_argument("--output-usd-per-mtok", type=float, default=0.60,
