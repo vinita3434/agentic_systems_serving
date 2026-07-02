@@ -133,9 +133,11 @@ class VLLMClient:
     def __init__(self, base_url: str = "http://localhost:8000/v1",
                  model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
                  api_key: str = "EMPTY",
-                 timeout: float = 300.0):
+                 timeout: float = 300.0,
+                 engine: str = "vllm"):
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.engine = engine
         self.headers = {"Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json"}
         self.timeout = timeout
@@ -210,23 +212,42 @@ class VLLMClient:
         )
 
     async def _fetch_cache_stats(self) -> tuple[Optional[int], Optional[float]]:
-        """Per-request prefix-cache hit stats, computed as the delta of
-        vLLM's cumulative counters since the previous chat call.
+        """Per-request prefix-cache hit stats, adapted per serving engine.
 
-        vLLM 0.6+ exposes Prometheus counters at /metrics:
-          - vllm:prefix_cache_queries_total  (queried prompt tokens)
-          - vllm:prefix_cache_hits_total     (served-from-cache tokens)
+        Different engines expose cache metrics under different names (and
+        some as a direct ratio gauge rather than counters). CACHE_METRIC_ADAPTERS
+        maps engine -> how to read them:
 
-        Both are cumulative. We snapshot them around each request and
-        return the delta so the metrics file shows per-call hit rate.
+          "counter" mode: two cumulative counters (queries, hits). We snapshot
+            them around each request and return the per-call delta ratio, since
+            the cumulative rate is uninformative across many requests.
+          "gauge" mode: a single instantaneous hit-rate gauge; returned as-is
+            (per-request token counts are not recoverable, so tokens = None).
+
+        vLLM / continuum / infercept share vLLM's counters. SGLang exposes its
+        own; the name below is a best guess (UNVERIFIED) — confirm against a
+        live `curl /metrics` on first real run. Any miss falls back to
+        (None, None) so the sweep still completes.
         """
+        adapter = CACHE_METRIC_ADAPTERS.get(self.engine,
+                                            CACHE_METRIC_ADAPTERS["vllm"])
+        mode = adapter["mode"]
         try:
             metrics_url = self.base_url.replace("/v1", "") + "/metrics"
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(metrics_url)
                 resp.raise_for_status()
-            queries = _parse_prom(resp.text, "vllm:prefix_cache_queries_total")
-            hits = _parse_prom(resp.text, "vllm:prefix_cache_hits_total")
+            text = resp.text
+
+            if mode == "gauge":
+                rate = _parse_prom(text, adapter["rate"])
+                if rate is not None:
+                    return None, max(0.0, min(1.0, rate))
+                return None, None
+
+            # counter mode
+            queries = _parse_prom(text, adapter["queries"])
+            hits = _parse_prom(text, adapter["hits"])
             if queries is None or hits is None:
                 return None, None
 
@@ -326,6 +347,26 @@ async def preflight_serving_check(base_url: str, serving_cfg: dict,
                 f"vLLM.")
 
     return warnings
+
+
+# Per-engine /metrics adapters. "counter" reads two cumulative counters and
+# returns their per-request delta ratio; "gauge" reads one instantaneous rate.
+# vLLM and its forks (continuum, infercept) inherit vLLM's counters. The
+# sglang entry is a best-guess metric name — verify with `curl :30000/metrics`.
+CACHE_METRIC_ADAPTERS: dict[str, dict[str, str]] = {
+    "vllm": {"mode": "counter",
+             "queries": "vllm:prefix_cache_queries_total",
+             "hits": "vllm:prefix_cache_hits_total"},
+    "vllm-continuum": {"mode": "counter",
+                       "queries": "vllm:prefix_cache_queries_total",
+                       "hits": "vllm:prefix_cache_hits_total"},
+    "infercept": {"mode": "counter",
+                  "queries": "vllm:prefix_cache_queries_total",
+                  "hits": "vllm:prefix_cache_hits_total"},
+    # UNVERIFIED metric name — confirm on first real SGLang run.
+    "sglang": {"mode": "gauge",
+               "rate": "sglang:cache_hit_rate"},
+}
 
 
 def _parse_prom(text: str, metric: str) -> Optional[float]:

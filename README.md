@@ -241,6 +241,8 @@ named question, vs 25 for a brute-force grid.
 | Engine preflight check | ✅ Pings `/v1/models` + fingerprints engine family at startup; warns on mismatch, reminds to confirm continuum env |
 | 5 layered design modes + 3 legacy modes | ✅ All 8 validated in mock |
 | Per-turn metrics (TTFT, latency, tokens, cache hits) | ✅ JSONL |
+| Trajectory-quality metrics (validity/error rate, turns-to-submit, thrash, action mix) | ✅ Per-episode JSONL + per-cell rollup |
+| Per-engine cache adapters + token-weighted rate + within-episode curve | ✅ `CACHE_METRIC_ADAPTERS` (vLLM counters; SGLang gauge name UNVERIFIED) |
 | Per-episode metrics (`verified` field) | ✅ JSONL — populates `null` in mock; calls SWE-bench evaluator in real runs |
 | vLLM `/metrics` cache-hit scraping | ✅ Wired in `VLLMClient` |
 | RunPod bootstrap script | ✅ Installs vanilla vLLM, sweagent, swebench, lmcache. Notes-only for SGLang + vllm-continuum (conflicting installs). |
@@ -319,6 +321,12 @@ what will be **derived** during analysis.
 | `completed` | Did the agent emit `submit`? |
 | `final_history_tokens` | Total history size at episode end |
 | `verified` | `True` if patch passes SWE-bench tests, `False` if not, `None` for mock / evaluation skip / parse failure |
+| `action_validity_rate` | Fraction of turns that produced a parseable action (1 − malformed-output rate) |
+| `error_rate` | Fraction of turns whose observation flagged an error (harness markers + common bash/Python failure signatures) |
+| `n_invalid_actions` / `n_repeated_actions` | Turns with no parseable action; turns re-issuing an identical bash command (thrash / stuck signal) |
+| `n_bash_actions` / `n_submit_actions` | Action-kind breakdown |
+| `turns_to_submit` | Turn index of first `submit` (`None` if never submitted) |
+| `cache_hit_rate_by_turn` | Per-turn cache-hit-rate series — the within-episode cache-growth curve |
 
 ### 7.3 Derived per cell (sweep summary)
 
@@ -328,7 +336,16 @@ Already computed by `MetricsLogger.summary()`:
 - `avg_prompt_tokens`, `avg_context_tokens`, `avg_raw_history_tokens`
 - `compression_ratio` = `avg(context_tokens) / avg(raw_history_tokens)`
 - `total_prompt_tokens`, `total_completion_tokens`
-- `avg_cache_hit_rate`
+- `avg_cache_hit_rate` (mean of per-turn rates)
+- `weighted_cache_hit_rate` = `sum(cache_hit_tokens) / sum(prompt_tokens)`
+  (token-weighted; truer than the flat average) + `total_cache_hit_tokens`
+- `avg_action_validity_rate`, `avg_error_rate`, `avg_turns_to_submit`
+  (trajectory-quality rollup across the cell's episodes)
+
+Cache-hit metrics are read per serving engine via `CACHE_METRIC_ADAPTERS`
+in `llm_client.py`: vLLM / continuum / infercept share vLLM's prefix-cache
+counters; SGLang uses a gauge-mode adapter (metric name UNVERIFIED — confirm
+against a live `/metrics` on first real run). A miss falls back to `None`.
 
 To be added in the analysis pass (downstream of the JSONLs):
 - **Task success rate**: `count(verified=True) / count(episodes)` per cell.
@@ -344,7 +361,8 @@ To be added in the analysis pass (downstream of the JSONLs):
 - **Cache-hit growth curves**: `cache_hit_rate` plotted against turn
   index within an episode. Tells you whether the orchestration's
   prefix stability is being exploited by the serving config (rising
-  curve) or not (flat curve).
+  curve) or not (flat curve). The raw per-turn series is now captured
+  per episode as `cache_hit_rate_by_turn` — plotting is all that remains.
 - **2×2 deltas for H1–H4**: for each hypothesis, compute the
   per-cell-vs-anchor TTFT and verified-rate deltas, then test whether
   the L3 cell's delta matches the predicted direction.

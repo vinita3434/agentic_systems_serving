@@ -70,7 +70,8 @@ class MetricsLogger:
                     wall_clock_s: float = 0.0,
                     gpu_hourly_usd: float = 1.40,
                     input_usd_per_mtok: float = 0.15,
-                    output_usd_per_mtok: float = 0.60) -> None:
+                    output_usd_per_mtok: float = 0.60,
+                    trajectory: Optional[dict] = None) -> None:
         """Per-episode summary row.
 
         Cost accounting per episode:
@@ -114,6 +115,9 @@ class MetricsLogger:
             "total_cost_usd": gpu_cost_usd,
             "timestamp": time.time(),
         }
+        # Trajectory-quality metrics + within-episode cache-hit curve.
+        if trajectory:
+            row.update(trajectory)
         with self.episode_log_path.open("a") as f:
             f.write(json.dumps(row) + "\n")
 
@@ -148,6 +152,14 @@ class MetricsLogger:
             "total_prompt_tokens": total("prompt_tokens"),
             "total_completion_tokens": total("completion_tokens"),
             "avg_cache_hit_rate": avg("cache_hit_rate"),
+            # Token-weighted hit rate: served-from-cache tokens over all prompt
+            # tokens. Truer than avg_cache_hit_rate, which weights every turn
+            # equally regardless of prompt size.
+            "total_cache_hit_tokens": total("cache_hit_tokens"),
+            "weighted_cache_hit_rate": (
+                total("cache_hit_tokens") / total("prompt_tokens")
+                if total("prompt_tokens") > 0 else 0.0
+            ),
         }
 
 

@@ -387,7 +387,8 @@ def make_llm_client(backend: str, serving_cfg: dict, vllm_base_url: str):
     if backend == "vllm":
         return VLLMClient(base_url=vllm_base_url,
                           model=serving_cfg.get("model",
-                                                "Qwen/Qwen2.5-Coder-7B-Instruct"))
+                                                "Qwen/Qwen2.5-Coder-7B-Instruct"),
+                          engine=serving_cfg.get("engine", "vllm"))
     raise ValueError(f"Unknown backend: {backend}")
 
 
@@ -455,6 +456,9 @@ async def run_sweep(args) -> list[dict]:
         cell_completion_tokens = 0
         cell_episodes = 0
         cell_verified = 0
+        cell_validity_sum = 0.0
+        cell_error_sum = 0.0
+        cell_turns_to_submit: list[int] = []
         for ep, task in enumerate(tasks):
             base_url = serving_base_url(serv_cfg, args.vllm_base_url)
             llm_client = make_llm_client(args.backend, serv_cfg, base_url)
@@ -485,6 +489,7 @@ async def run_sweep(args) -> list[dict]:
                     gpu_hourly_usd=args.gpu_hourly_usd,
                     input_usd_per_mtok=args.input_usd_per_mtok,
                     output_usd_per_mtok=args.output_usd_per_mtok,
+                    trajectory=ep_result.trajectory,
                 )
                 cell_wall_clock_s += ep_result.wall_clock_s
                 cell_prompt_tokens += ep_result.total_prompt_tokens
@@ -492,6 +497,11 @@ async def run_sweep(args) -> list[dict]:
                 cell_episodes += 1
                 if ep_result.verified is True:
                     cell_verified += 1
+                tj = ep_result.trajectory or {}
+                cell_validity_sum += tj.get("action_validity_rate", 0.0)
+                cell_error_sum += tj.get("error_rate", 0.0)
+                if tj.get("turns_to_submit") is not None:
+                    cell_turns_to_submit.append(tj["turns_to_submit"])
             finally:
                 close = getattr(tools, "close", None)
                 if callable(close):
@@ -522,6 +532,14 @@ async def run_sweep(args) -> list[dict]:
         s["cost_per_episode_usd"] = (gpu_cost / cell_episodes) if cell_episodes else None
         s["cost_per_verified_task_usd"] = (
             (gpu_cost / cell_verified) if cell_verified > 0 else None)
+        # Trajectory-quality rollup (averaged over the cell's episodes).
+        s["avg_action_validity_rate"] = (
+            cell_validity_sum / cell_episodes) if cell_episodes else None
+        s["avg_error_rate"] = (
+            cell_error_sum / cell_episodes) if cell_episodes else None
+        s["avg_turns_to_submit"] = (
+            sum(cell_turns_to_submit) / len(cell_turns_to_submit)
+            if cell_turns_to_submit else None)
         summaries.append(s)
         print(f"  turns={s['n_turns']:3d} "
               f"avg_ttft={s['avg_ttft_ms']:7.1f}ms "
@@ -534,6 +552,10 @@ async def run_sweep(args) -> list[dict]:
               f"in_toks={cell_prompt_tokens} out_toks={cell_completion_tokens} "
               f"gpu_cost=${gpu_cost:.4f} api_equiv=${api_equiv_cost:.4f} "
               f"cost/task=${(gpu_cost/cell_episodes if cell_episodes else 0):.4f}")
+        print(f"  traj: validity={(s['avg_action_validity_rate'] or 0):.2f} "
+              f"error_rate={(s['avg_error_rate'] or 0):.2f} "
+              f"turns_to_submit={s['avg_turns_to_submit']} "
+              f"weighted_cache_hit={(s.get('weighted_cache_hit_rate') or 0):.2f}")
 
     summary_path = RESULTS_DIR / f"sweep{sweep_id}_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)

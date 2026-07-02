@@ -64,6 +64,28 @@ class EpisodeResult:
     total_prompt_tokens: int = 0       # sum of prompt_tokens across all turns
     total_completion_tokens: int = 0   # sum of completion_tokens across all turns
     wall_clock_s: float = 0.0          # episode duration from first turn to terminal
+    # Trajectory-quality metrics (how the agent worked, not just whether it
+    # succeeded) + the within-episode cache-hit-rate curve. See run_episode.
+    trajectory: dict = field(default_factory=dict)
+
+
+# Substrings that mark an observation as a failed / error action. The first
+# three are harness-injected and reliable; the rest are common bash / Python
+# failure signatures (heuristic — real stdout has no exit code exposed).
+_ERROR_MARKERS = (
+    "[error:",
+    "[submit failed",
+    "[no valid action found]",
+    "command not found",
+    "no such file or directory",
+    "traceback (most recent call last)",
+    "syntaxerror",
+)
+
+
+def _is_error_observation(content: str) -> bool:
+    low = content.lower()
+    return any(marker in low for marker in _ERROR_MARKERS)
 
 
 def _format_observation(obs: Observation) -> Message:
@@ -128,6 +150,12 @@ async def run_episode(
     total_completion_tokens = 0
     t_episode_start = asyncio.get_running_loop().time()
 
+    # Trajectory-quality accumulators.
+    n_valid = n_invalid = n_bash = n_submit = n_error_obs = n_repeat = 0
+    turns_to_submit: Optional[int] = None
+    prev_bash_cmd: Optional[str] = None
+    cache_hit_rate_by_turn: list[Optional[float]] = []
+
     for turn in range(1, max_turns + 1):
         assembled = assemble(strategy, history, params,
                              summarizer=_sync_summarizer if strategy == "summarization" else None)
@@ -154,21 +182,40 @@ async def run_episode(
         ))
         total_prompt_tokens += result.prompt_tokens
         total_completion_tokens += result.completion_tokens
+        cache_hit_rate_by_turn.append(result.cache_hit_rate)
 
         last_finish_reason = result.finish_reason
         history.append(_format_assistant(result.content))
 
         action = parse_action(result.content)
         if action is None:
+            # Model produced no parseable action: both an invalid action and
+            # an error observation.
+            n_invalid += 1
+            n_error_obs += 1
             history.append({"role": "user",
                             "content": "<output>\n[no valid action found]\n</output>",
                             "meta": {"kind": "observation"}})
             continue
 
+        n_valid += 1
+        if action.kind == "submit":
+            n_submit += 1
+            if turns_to_submit is None:
+                turns_to_submit = turn
+        elif action.kind == "bash":
+            n_bash += 1
+            cmd_norm = action.command.strip()
+            if prev_bash_cmd is not None and cmd_norm == prev_bash_cmd:
+                n_repeat += 1  # re-issued an identical command (thrash / stuck)
+            prev_bash_cmd = cmd_norm
+
         # tools.execute may block (SWEEnv runs bash in a docker container).
         # Run it off the event loop so we don't stall the LLM client.
         observation = await asyncio.get_running_loop().run_in_executor(
             None, tools.execute, action)
+        if _is_error_observation(observation.content):
+            n_error_obs += 1
         history.append(_format_observation(observation))
 
         if observation.is_terminal or action.kind == "submit":
@@ -191,6 +238,20 @@ async def run_episode(
 
     wall_clock_s = asyncio.get_running_loop().time() - t_episode_start
 
+    denom = turn  # turns actually executed (loop variable persists post-loop)
+    trajectory = {
+        "n_valid_actions": n_valid,
+        "n_invalid_actions": n_invalid,
+        "n_bash_actions": n_bash,
+        "n_submit_actions": n_submit,
+        "n_error_observations": n_error_obs,
+        "n_repeated_actions": n_repeat,
+        "action_validity_rate": (n_valid / denom) if denom else 0.0,
+        "error_rate": (n_error_obs / denom) if denom else 0.0,
+        "turns_to_submit": turns_to_submit,      # None if never submitted
+        "cache_hit_rate_by_turn": cache_hit_rate_by_turn,
+    }
+
     return EpisodeResult(
         task_id=task.task_id,
         n_turns=turn,
@@ -201,6 +262,7 @@ async def run_episode(
         total_prompt_tokens=total_prompt_tokens,
         total_completion_tokens=total_completion_tokens,
         wall_clock_s=wall_clock_s,
+        trajectory=trajectory,
     )
 
 
