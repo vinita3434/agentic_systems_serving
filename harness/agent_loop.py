@@ -104,6 +104,45 @@ def _common_prefix_len(a: str, b: str) -> int:
     return i
 
 
+_TOKENIZER_CACHE: dict[str, Any] = {}
+
+
+def _get_tokenizer(model: str):
+    """Lazily load the model's tokenizer for exact R_n token counting.
+    Returns None if transformers / the tokenizer can't be loaded, in which
+    case the caller falls back to a ~4-chars/token estimate."""
+    if model in _TOKENIZER_CACHE:
+        return _TOKENIZER_CACHE[model]
+    tok = None
+    try:
+        from transformers import AutoTokenizer  # type: ignore
+        tok = AutoTokenizer.from_pretrained(model)
+    except Exception:
+        tok = None
+    _TOKENIZER_CACHE[model] = tok
+    return tok
+
+
+def _prefix_tokens(prev: Optional[str], cur: str, tokenizer) -> int:
+    """Reusable-prefix tokens R_n between two serialized prompts. Uses the
+    real tokenizer when available (exact token-sequence common prefix);
+    otherwise estimates at ~4 chars/token."""
+    if prev is None:
+        return 0
+    if tokenizer is not None:
+        try:
+            a = tokenizer.encode(prev, add_special_tokens=False)
+            b = tokenizer.encode(cur, add_special_tokens=False)
+            n = min(len(a), len(b))
+            i = 0
+            while i < n and a[i] == b[i]:
+                i += 1
+            return i
+        except Exception:
+            pass
+    return _common_prefix_len(prev, cur) // 4
+
+
 def _format_observation(obs: Observation) -> Message:
     return {"role": "user", "content": obs.content, "meta": {"kind": "observation"}}
 
@@ -174,19 +213,18 @@ async def run_episode(
     reusable_prefix_by_turn: list[int] = []
     error_flags: list[bool] = []          # per-turn: did this turn hit an error?
     prev_prompt_text: Optional[str] = None
+    tokenizer = _get_tokenizer(serving_cfg.get("model",
+                                               "Qwen/Qwen2.5-Coder-7B-Instruct"))
 
     for turn in range(1, max_turns + 1):
         assembled = assemble(strategy, history, params,
                              summarizer=_sync_summarizer if strategy == "summarization" else None)
 
-        # Reusable prefix (R_n): chars this prompt shares with the previous
-        # turn's prompt, estimated to tokens (~4 chars/token, matching the
-        # mock token estimator). Turn 1 has no predecessor -> 0.
+        # Reusable prefix (R_n): tokens this prompt shares with the previous
+        # turn's prompt. Uses the real model tokenizer when available, else a
+        # ~4-chars/token estimate. Turn 1 has no predecessor -> 0.
         prompt_text = _serialize_prompt(assembled.messages)
-        if prev_prompt_text is None:
-            reusable_prefix_tokens = 0
-        else:
-            reusable_prefix_tokens = _common_prefix_len(prev_prompt_text, prompt_text) // 4
+        reusable_prefix_tokens = _prefix_tokens(prev_prompt_text, prompt_text, tokenizer)
         prev_prompt_text = prompt_text
         reusable_prefix_by_turn.append(reusable_prefix_tokens)
 
