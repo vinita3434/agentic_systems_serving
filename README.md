@@ -115,11 +115,12 @@ each non-origin strategy is a one-axis variation from there.
 
 ### Serving (`configs/serving/`)
 
-Five configurations, treating cache management as the independent
+Six configurations, treating cache management as the independent
 variable. All configs target `Qwen/Qwen2.5-Coder-7B-Instruct`; the
 `engine` field dispatches to vanilla vLLM, the
-[vllm-continuum](https://github.com/Hanchenli/vllm-continuum) fork, or
-SGLang.
+[vllm-continuum](https://github.com/Hanchenli/vllm-continuum) fork,
+INFERCEPT (a vLLM fork), or SGLang. Each config binds a distinct port
+(8000–8004, sglang 30000) so engines never collide.
 
 | Config | Engine | Caching mechanism | Role |
 |---|---|---|---|
@@ -128,6 +129,7 @@ SGLang.
 | `vllm_lmcache` | vllm | Prefix cache + CPU-tier spill via `LMCacheConnectorV1` | Tiered cache under pressure |
 | `sglang` | sglang | RadixAttention prefix-tree sharing | Alternative engine, workflow-blind |
 | `vllm_continuum` | vllm-continuum | Workflow-aware KV TTL (tool-output blocks retained longer) | Workflow-aware serving |
+| `infercept` | infercept | Intercept-aware KV (preserve/discard/swap KV during tool-call pauses) | Workflow-aware serving (interception-based) |
 
 ### Agent loop (`harness/agent_loop.py`)
 
@@ -178,8 +180,8 @@ Other flags:
 - `--vllm-base-url URL` — optional override. By default the server URL is
   **derived from each serving config's `port`** (each engine binds a
   distinct port: cache_off=8000, vllm_lru=8001, vllm_lmcache=8002,
-  vllm_continuum=8003, sglang=30000), so `--serving <name>` automatically
-  targets the right server.
+  vllm_continuum=8003, infercept=8004, sglang=30000), so `--serving <name>`
+  automatically targets the right server.
 - `--skip-serving-check` — skip the startup preflight (see §5) that
   confirms the running engine matches the requested `--serving` config.
 
@@ -233,7 +235,7 @@ named question, vs 25 for a brute-force grid.
 |---|---|
 | Custom agent loop | ✅ End-to-end working |
 | 5 orchestration strategies | ✅ Implemented + validated in mock |
-| 5 serving configs (cache-focused) | ✅ YAMLs + engine-dispatch launcher; distinct port per config |
+| 6 serving configs (cache-focused) | ✅ YAMLs + engine-dispatch launcher; distinct port per config. `infercept` launch command + repo unverified (marked in YAML / start_vllm.sh). |
 | Modular `--layer` interface (serving / orchestration / interactions / custom) | ✅ Compartmentalized run selection + per-config filtering |
 | Auto-derived server URL from serving config port | ✅ `--serving <name>` targets the right port; `--vllm-base-url` is an override |
 | Engine preflight check | ✅ Pings `/v1/models` + fingerprints engine family at startup; warns on mismatch, reminds to confirm continuum env |

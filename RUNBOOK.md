@@ -62,6 +62,14 @@ deactivate
 # SGLang → sglang
 python3 -m venv ~/envs/sglang
 source ~/envs/sglang/bin/activate && pip install 'sglang[all]' && deactivate
+
+# INFERCEPT fork → infercept  (verify repo + install against the fork README)
+python3 -m venv ~/envs/infercept
+source ~/envs/infercept/bin/activate
+git clone https://github.com/WukLab/InferCept ~/infercept   # confirm this URL
+pip install -e ~/infercept
+which vllm                        # the fork installs under the vllm package
+deactivate
 ```
 
 ---
@@ -121,7 +129,8 @@ tmux kill-session -t engine
 | 2 | vllm       | `vllm_lru`       | 8001                   |
 | 3 | vllm       | `vllm_lmcache`   | 8002                   |
 | 4 | continuum  | `vllm_continuum` | 8003                   |
-| 5 | sglang     | `sglang`         | 30000                  |
+| 5 | infercept  | `infercept`      | 8004                   |
+| 6 | sglang     | `sglang`         | 30000                  |
 
 Each iteration = 5 orchestration cells × `--task-limit` tasks. With
 `--task-limit 5` that's 25 episodes per serving config, 125 total.
@@ -192,7 +201,8 @@ cell served by the correct engine — the dataset the H1–H4 hypotheses need.
   vLLM server "works" but measures vanilla. The preflight ⚠ is your guard;
   also check `which vllm` in the continuum env.
 - **Ports are per-config and automatic.** cache_off=8000, vllm_lru=8001,
-  vllm_lmcache=8002, vllm_continuum=8003, sglang=30000. The harness derives
+  vllm_lmcache=8002, vllm_continuum=8003, infercept=8004, sglang=30000.
+  The harness derives
   the URL from the config, so you normally don't pass `--vllm-base-url` at
   all. If you change a `port:` in a YAML, both the server and the harness
   pick it up automatically.

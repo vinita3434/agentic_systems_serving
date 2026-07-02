@@ -315,13 +315,15 @@ async def preflight_serving_check(base_url: str, serving_cfg: dict,
                 f"fingerprints as '{running_family}'. You are likely measuring "
                 f"the wrong engine.")
 
-        # 3. Continuum cannot be distinguished from vanilla vLLM via the API.
-        if expected_engine == "vllm-continuum":
+        # 3. vLLM forks cannot be distinguished from vanilla vLLM via the API.
+        if expected_engine in ("vllm-continuum", "infercept"):
+            fork = "vllm-continuum" if expected_engine == "vllm-continuum" else "INFERCEPT"
             warnings.append(
-                "config expects the vllm-continuum fork, which is "
-                "API-indistinguishable from vanilla vLLM. Confirm the server "
-                "was started from the continuum env (`which vllm` -> fork "
-                "checkout); otherwise this run silently measures vanilla vLLM.")
+                f"config expects the {fork} fork, which is "
+                f"API-indistinguishable from vanilla vLLM. Confirm the server "
+                f"was started from the {fork} env (`which vllm` / check the "
+                f"active venv); otherwise this run silently measures vanilla "
+                f"vLLM.")
 
     return warnings
 

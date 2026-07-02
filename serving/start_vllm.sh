@@ -64,13 +64,25 @@ def add_flag(cmd, key, val):
         cmd += [flag, str(val)]
 
 
-if engine in ("vllm", "vllm-continuum"):
+if engine in ("vllm", "vllm-continuum", "infercept"):
     if engine == "vllm-continuum":
         if not shutil.which("vllm"):
             sys.exit("ERROR: engine=vllm-continuum requires the `vllm` CLI "
                      "from the Hanchenli/vllm-continuum fork to be on PATH. "
                      "Install per the fork's README, then retry.")
         cmd = ["vllm", "serve", model, "--host", host, "--port", str(port)]
+    elif engine == "infercept":
+        # INFERCEPT is a vLLM fork. ASSUMPTION, verify against the fork
+        # README: it exposes the OpenAI-compatible api_server like upstream
+        # vLLM. If the fork ships a different entrypoint, edit this branch.
+        try:
+            import vllm  # noqa: F401  -- the fork installs under the vllm package
+        except ImportError:
+            sys.exit("ERROR: engine=infercept requires the INFERCEPT vLLM "
+                     "fork installed (replaces vanilla vLLM). Install it into "
+                     "its own venv per the fork's README, then retry.")
+        cmd = [sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+               "--model", model, "--host", host, "--port", str(port)]
     else:
         try:
             import vllm  # noqa: F401

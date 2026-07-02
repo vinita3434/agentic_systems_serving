@@ -1,0 +1,35 @@
+name: infercept
+engine: infercept
+description: |
+  INFERCEPT (WukLab, ICML 2024) — interception-aware LLM serving, built as
+  a vLLM fork. When generation is "intercepted" by a tool/API call, the
+  engine decides per-request whether to preserve, discard, or swap the KV
+  cache for the paused sequence, minimizing GPU memory waste during the
+  wait. A second workflow-aware serving condition alongside vllm_continuum:
+  continuum manages KV by tool-output TTL; INFERCEPT manages KV around the
+  interception event itself. Tests whether intercept-aware memory handling
+  changes serving behavior under the agent loop relative to vllm_lru.
+
+  NOTE (verify before first real run):
+    - Repo / install: assumed to be the WukLab/InferCept vLLM fork. Confirm
+      the exact checkout and `pip install -e .` step, and that it serves
+      Qwen2.5-Coder-7B. Install it into its own venv (it replaces vanilla
+      vLLM, same as the continuum fork).
+    - Launch command: start_vllm.sh currently treats engine=infercept as a
+      vLLM fork exposing the OpenAI-compatible server. If the fork uses a
+      different entrypoint, adjust the infercept branch in start_vllm.sh.
+gpu_classes: [A100, H100]
+model: Qwen/Qwen2.5-Coder-7B-Instruct
+host: 0.0.0.0
+port: 8004
+flags:
+  enable_prefix_caching: true
+  enable_chunked_prefill: true
+  dtype: bfloat16
+  gpu_memory_utilization: 0.90
+  max_model_len: 32768
+  max_num_batched_tokens: 2048
+  max_num_seqs: 64
+extra_args:
+  - "--enable-auto-tool-choice"
+  - "--tool-call-parser=hermes"
