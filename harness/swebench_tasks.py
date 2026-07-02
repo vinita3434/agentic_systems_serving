@@ -30,6 +30,7 @@ class SWEBenchTask:
     version: str = ""
     test_patch: str = ""
     patch: str = ""         # the gold patch (used only for evaluation)
+    difficulty: str = ""    # Verified-split annotation, e.g. "1-4 hours"
 
     def as_task(self):
         """Convert to the lightweight Task used by agent_loop.run_episode."""
@@ -44,11 +45,23 @@ _DATASET_NAMES = {
     "verified": "princeton-nlp/SWE-bench_Verified",
 }
 
+# Difficulty buckets in SWE-bench_Verified considered "hard" — tasks that
+# take a human 1+ hours, and thus tend to require long agent trajectories.
+# Matched loosely (substring, lowercased) since the exact label strings can
+# vary slightly across dataset revisions.
+_HARD_DIFFICULTY_KEYWORDS = ("1-4 hour", ">4 hour", "1-4 hours", ">4 hours")
+
+
+def _is_hard(difficulty: str) -> bool:
+    d = (difficulty or "").lower()
+    return any(k in d for k in _HARD_DIFFICULTY_KEYWORDS)
+
 
 def load_swebench_tasks(split: str = "full",
                        split_name: str = "test",
                        limit: Optional[int] = None,
-                       instance_ids: Optional[Iterable[str]] = None
+                       instance_ids: Optional[Iterable[str]] = None,
+                       hard_only: bool = False
                        ) -> list[SWEBenchTask]:
     """
     Load SWE-bench task instances.
@@ -58,6 +71,9 @@ def load_swebench_tasks(split: str = "full",
         split_name: HF dataset split, almost always 'test'.
         limit: take first N after filtering (None = all).
         instance_ids: if provided, keep only these IDs.
+        hard_only: keep only hard-difficulty tasks (1-4 hrs / >4 hrs).
+            Requires the 'verified' split — only it carries a difficulty
+            annotation.
 
     Requires:
         pip install datasets
@@ -65,6 +81,11 @@ def load_swebench_tasks(split: str = "full",
     if split not in _DATASET_NAMES:
         raise ValueError(f"Unknown SWE-bench split '{split}'. "
                          f"Choose from {list(_DATASET_NAMES)}.")
+    if hard_only and split != "verified":
+        raise ValueError(
+            "hard_only=True requires split='verified' — only the Verified "
+            "split carries a difficulty annotation. Re-run with "
+            "--swebench-split verified.")
     try:
         from datasets import load_dataset
     except ImportError as e:
@@ -78,6 +99,14 @@ def load_swebench_tasks(split: str = "full",
     if instance_ids is not None:
         wanted = set(instance_ids)
         ds = ds.filter(lambda row: row["instance_id"] in wanted)
+
+    if hard_only:
+        ds = ds.filter(lambda row: _is_hard(row.get("difficulty", "")))
+        if len(ds) == 0:
+            raise ValueError(
+                "hard_only filter matched 0 instances. Check the Verified "
+                "split's difficulty labels (expected buckets like '1-4 hours' "
+                "/ '>4 hours').")
 
     if limit is not None:
         ds = ds.select(range(min(limit, len(ds))))
@@ -93,5 +122,6 @@ def load_swebench_tasks(split: str = "full",
             version=row.get("version", ""),
             test_patch=row.get("test_patch", ""),
             patch=row.get("patch", ""),
+            difficulty=row.get("difficulty", ""),
         ))
     return out

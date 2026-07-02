@@ -333,7 +333,7 @@ def select_cells_modular(orch: dict[str, dict], serving: dict[str, dict],
 
 
 def load_tasks(task_source: str, swebench_split: str, task_limit: int,
-               task_id: str | None) -> list[Task]:
+               task_id: str | None, hard_only: bool = False) -> list[Task]:
     if task_source == "mock":
         return [DEFAULT_MOCK_TASK]
     if task_source == "swebench":
@@ -341,7 +341,8 @@ def load_tasks(task_source: str, swebench_split: str, task_limit: int,
         ids = [task_id] if task_id else None
         instances = load_swebench_tasks(split=swebench_split,
                                         limit=task_limit if not ids else None,
-                                        instance_ids=ids)
+                                        instance_ids=ids,
+                                        hard_only=hard_only)
         return [i.as_task() for i in instances]
     raise ValueError(f"Unknown task source: {task_source}")
 
@@ -407,8 +408,17 @@ async def run_sweep(args) -> list[dict]:
     else:
         cells = select_cells(orch_configs, serving_configs, interactions_cfg, args.design)
         design_label = args.design
+    # Hard tasks need room for long trajectories; make sure max_turns isn't
+    # the thing that ends the episode. We do NOT force a minimum turn count —
+    # the agent still submits when it's done; the difficulty filter is what
+    # produces long episodes.
+    if args.hard_only and args.max_turns < 40:
+        print(f"[--hard-only] raising max_turns {args.max_turns} -> 60 so long "
+              f"episodes aren't truncated.")
+        args.max_turns = 60
+
     tasks = load_tasks(args.task_source, args.swebench_split,
-                       args.task_limit, args.task_id)
+                       args.task_limit, args.task_id, hard_only=args.hard_only)
 
     sweep_id = int(time.time())
     summaries: list[dict] = []
@@ -664,6 +674,11 @@ def main():
                    help="Number of SWE-bench instances per cell.")
     p.add_argument("--task-id", default=None,
                    help="Single SWE-bench instance_id; overrides --task-limit.")
+    p.add_argument("--hard-only", action="store_true",
+                   help="Keep only hard-difficulty tasks (1-4 hrs / >4 hrs). "
+                        "Requires --swebench-split verified. Long trajectories "
+                        "make cache/serving metrics more informative. Auto-"
+                        "raises --max-turns to 60 if lower.")
     p.add_argument("--max-turns", type=int, default=20)
     p.add_argument("--skip-serving-check", action="store_true",
                    help="Skip the startup check that the running engine "

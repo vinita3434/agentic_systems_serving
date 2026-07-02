@@ -157,6 +157,7 @@ Each iteration = 5 orchestration cells × `--task-limit` tasks. With
 | `--task-source {mock,swebench}` | Canned task vs real dataset instances. |
 | `--task-limit N` | Tasks (episodes) per cell. Default 5. |
 | `--task-id ID` | Single SWE-bench instance; overrides `--task-limit`. |
+| `--hard-only` | Keep only hard tasks (1-4 hrs / >4 hrs). Needs `--swebench-split verified`. Auto-raises `--max-turns` to 60. |
 | `--max-turns N` | Max agent turns per episode. Default 20. |
 | `--gpu-class {A100,H100}` | Skip serving configs incompatible with this GPU. |
 | `--skip-serving-check` | Skip the engine-match preflight (vllm backend). |
