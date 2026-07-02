@@ -58,14 +58,20 @@ if [[ ! -d "${REPO_DIR}" ]]; then
 fi
 cd "${REPO_DIR}"
 
-echo "==[4/6]== Base Python deps (vanilla vLLM + harness + sweagent + lmcache)"
-"${PYTHON_BIN}" -m pip install --upgrade \
-    'vllm>=0.6.0' \
-    'sweagent' \
-    'swebench' \
-    'datasets>=2.20' \
-    'lmcache' \
-    -r requirements.txt
+echo "==[4/6]== Base Python deps"
+# Install in INDEPENDENT steps so one bad package can't abort the rest.
+# (a) serving + harness — required to bring up the vLLM server. Fail hard.
+"${PYTHON_BIN}" -m pip install --upgrade 'vllm>=0.6.0' 'lmcache' -r requirements.txt
+
+# (b) evaluation harness + dataset loader — needed only for real task eval.
+"${PYTHON_BIN}" -m pip install --upgrade 'swebench' 'datasets>=2.20' \
+    || echo "WARN: swebench/datasets install failed — needed only for eval."
+
+# (c) SWE-agent — needed only to run SWE-bench tasks inside SWEEnv. The PyPI
+#     'sweagent' package pulls a broken dependency (togetherunidiff), so we
+#     install from source instead. Non-fatal so serving still works if it fails.
+"${PYTHON_BIN}" -m pip install 'git+https://github.com/princeton-nlp/SWE-agent.git' \
+    || echo "WARN: SWE-agent install failed — needed only for running tasks."
 
 cat <<'EOF'
 
