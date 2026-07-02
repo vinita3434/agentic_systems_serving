@@ -323,6 +323,8 @@ what will be **derived** during analysis.
 | `verified` | `True` if patch passes SWE-bench tests, `False` if not, `None` for mock / evaluation skip / parse failure |
 | `action_validity_rate` | Fraction of turns that produced a parseable action (1 − malformed-output rate) |
 | `error_rate` | Fraction of turns whose observation flagged an error (harness markers + common bash/Python failure signatures) |
+| `error_recovery_rate` | Of error turns with a following turn, fraction followed by a non-error turn (agent got unstuck); `None` if no recoverable errors |
+| `reusable_prefix_by_turn` | Per-turn `R_n` = tokens repeating from the previous turn (the cache-eligible prefix) |
 | `n_invalid_actions` / `n_repeated_actions` | Turns with no parseable action; turns re-issuing an identical bash command (thrash / stuck signal) |
 | `n_bash_actions` / `n_submit_actions` | Action-kind breakdown |
 | `turns_to_submit` | Turn index of first `submit` (`None` if never submitted) |
@@ -339,8 +341,12 @@ Already computed by `MetricsLogger.summary()`:
 - `avg_cache_hit_rate` (mean of per-turn rates)
 - `weighted_cache_hit_rate` = `sum(cache_hit_tokens) / sum(prompt_tokens)`
   (token-weighted; truer than the flat average) + `total_cache_hit_tokens`
-- `avg_action_validity_rate`, `avg_error_rate`, `avg_turns_to_submit`
-  (trajectory-quality rollup across the cell's episodes)
+- `weighted_cache_efficiency` = `sum(cache_hit_tokens) / sum(reusable_prefix_tokens)`
+  — of the cache-eligible (repeated) tokens, the fraction the serving layer
+  actually kept and reused. Isolates the serving config's cache control from
+  how much reusable prefix orchestration provided.
+- `avg_action_validity_rate`, `avg_error_rate`, `avg_error_recovery_rate`,
+  `avg_turns_to_submit` (trajectory-quality rollup across the cell's episodes)
 
 Cache-hit metrics are read per serving engine via `CACHE_METRIC_ADAPTERS`
 in `llm_client.py`: vLLM / continuum / infercept share vLLM's prefix-cache

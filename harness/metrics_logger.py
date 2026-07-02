@@ -42,6 +42,10 @@ class TurnMetrics:
     total_latency_ms: float
     cache_hit_rate: Optional[float] = None
     cache_hit_tokens: Optional[int] = None
+    # Reusable-prefix tokens (R_n): tokens at the start of this turn's prompt
+    # that repeat from the previous turn (i.e. eligible to be a cache hit).
+    # Orchestration property; the denominator for cache_efficiency.
+    reusable_prefix_tokens: Optional[int] = None
     finish_reason: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
 
@@ -159,6 +163,15 @@ class MetricsLogger:
             "weighted_cache_hit_rate": (
                 total("cache_hit_tokens") / total("prompt_tokens")
                 if total("prompt_tokens") > 0 else 0.0
+            ),
+            # Cache efficiency: of the tokens that repeated from earlier turns
+            # (reusable prefix), what fraction the serving layer actually kept
+            # in cache and reused. Isolates the serving config's cache control
+            # from how much reusable prefix orchestration provided.
+            "total_reusable_prefix_tokens": total("reusable_prefix_tokens"),
+            "weighted_cache_efficiency": (
+                total("cache_hit_tokens") / total("reusable_prefix_tokens")
+                if total("reusable_prefix_tokens") > 0 else None
             ),
         }
 

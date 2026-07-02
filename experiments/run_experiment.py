@@ -459,6 +459,7 @@ async def run_sweep(args) -> list[dict]:
         cell_validity_sum = 0.0
         cell_error_sum = 0.0
         cell_turns_to_submit: list[int] = []
+        cell_recovery_rates: list[float] = []
         for ep, task in enumerate(tasks):
             base_url = serving_base_url(serv_cfg, args.vllm_base_url)
             llm_client = make_llm_client(args.backend, serv_cfg, base_url)
@@ -502,6 +503,8 @@ async def run_sweep(args) -> list[dict]:
                 cell_error_sum += tj.get("error_rate", 0.0)
                 if tj.get("turns_to_submit") is not None:
                     cell_turns_to_submit.append(tj["turns_to_submit"])
+                if tj.get("error_recovery_rate") is not None:
+                    cell_recovery_rates.append(tj["error_recovery_rate"])
             finally:
                 close = getattr(tools, "close", None)
                 if callable(close):
@@ -540,6 +543,9 @@ async def run_sweep(args) -> list[dict]:
         s["avg_turns_to_submit"] = (
             sum(cell_turns_to_submit) / len(cell_turns_to_submit)
             if cell_turns_to_submit else None)
+        s["avg_error_recovery_rate"] = (
+            sum(cell_recovery_rates) / len(cell_recovery_rates)
+            if cell_recovery_rates else None)
         summaries.append(s)
         print(f"  turns={s['n_turns']:3d} "
               f"avg_ttft={s['avg_ttft_ms']:7.1f}ms "
@@ -552,10 +558,15 @@ async def run_sweep(args) -> list[dict]:
               f"in_toks={cell_prompt_tokens} out_toks={cell_completion_tokens} "
               f"gpu_cost=${gpu_cost:.4f} api_equiv=${api_equiv_cost:.4f} "
               f"cost/task=${(gpu_cost/cell_episodes if cell_episodes else 0):.4f}")
+        _eff = s.get("weighted_cache_efficiency")
+        _rec = s.get("avg_error_recovery_rate")
         print(f"  traj: validity={(s['avg_action_validity_rate'] or 0):.2f} "
               f"error_rate={(s['avg_error_rate'] or 0):.2f} "
-              f"turns_to_submit={s['avg_turns_to_submit']} "
-              f"weighted_cache_hit={(s.get('weighted_cache_hit_rate') or 0):.2f}")
+              f"recovery={('n/a' if _rec is None else f'{_rec:.2f}')} "
+              f"turns_to_submit={s['avg_turns_to_submit']}")
+        print(f"  cache: weighted_hit={(s.get('weighted_cache_hit_rate') or 0):.2f} "
+              f"efficiency={('n/a' if _eff is None else f'{_eff:.2f}')} "
+              f"(hit=used/sent, efficiency=used/reusable)")
 
     summary_path = RESULTS_DIR / f"sweep{sweep_id}_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)

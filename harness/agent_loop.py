@@ -88,6 +88,22 @@ def _is_error_observation(content: str) -> bool:
     return any(marker in low for marker in _ERROR_MARKERS)
 
 
+def _serialize_prompt(messages: list[Message]) -> str:
+    """Flatten assembled messages to a string for prefix comparison. The
+    exact form only needs to be stable turn-to-turn, not match the model's
+    tokenizer — this is a diagnostic, not the served prompt."""
+    return "\n".join(f"<{m.get('role', 'user')}>\n{m.get('content', '')}"
+                     for m in messages)
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
 def _format_observation(obs: Observation) -> Message:
     return {"role": "user", "content": obs.content, "meta": {"kind": "observation"}}
 
@@ -155,10 +171,24 @@ async def run_episode(
     turns_to_submit: Optional[int] = None
     prev_bash_cmd: Optional[str] = None
     cache_hit_rate_by_turn: list[Optional[float]] = []
+    reusable_prefix_by_turn: list[int] = []
+    error_flags: list[bool] = []          # per-turn: did this turn hit an error?
+    prev_prompt_text: Optional[str] = None
 
     for turn in range(1, max_turns + 1):
         assembled = assemble(strategy, history, params,
                              summarizer=_sync_summarizer if strategy == "summarization" else None)
+
+        # Reusable prefix (R_n): chars this prompt shares with the previous
+        # turn's prompt, estimated to tokens (~4 chars/token, matching the
+        # mock token estimator). Turn 1 has no predecessor -> 0.
+        prompt_text = _serialize_prompt(assembled.messages)
+        if prev_prompt_text is None:
+            reusable_prefix_tokens = 0
+        else:
+            reusable_prefix_tokens = _common_prefix_len(prev_prompt_text, prompt_text) // 4
+        prev_prompt_text = prompt_text
+        reusable_prefix_by_turn.append(reusable_prefix_tokens)
 
         result: CompletionResult = await llm_client.chat(
             assembled.messages, max_tokens=512, temperature=0.0
@@ -178,6 +208,7 @@ async def run_episode(
             total_latency_ms=result.total_latency_ms,
             cache_hit_rate=result.cache_hit_rate,
             cache_hit_tokens=result.cache_hit_tokens,
+            reusable_prefix_tokens=reusable_prefix_tokens,
             finish_reason=result.finish_reason,
         ))
         total_prompt_tokens += result.prompt_tokens
@@ -193,6 +224,7 @@ async def run_episode(
             # an error observation.
             n_invalid += 1
             n_error_obs += 1
+            error_flags.append(True)
             history.append({"role": "user",
                             "content": "<output>\n[no valid action found]\n</output>",
                             "meta": {"kind": "observation"}})
@@ -214,8 +246,10 @@ async def run_episode(
         # Run it off the event loop so we don't stall the LLM client.
         observation = await asyncio.get_running_loop().run_in_executor(
             None, tools.execute, action)
-        if _is_error_observation(observation.content):
+        obs_is_error = _is_error_observation(observation.content)
+        if obs_is_error:
             n_error_obs += 1
+        error_flags.append(obs_is_error)
         history.append(_format_observation(observation))
 
         if observation.is_terminal or action.kind == "submit":
@@ -239,6 +273,19 @@ async def run_episode(
     wall_clock_s = asyncio.get_running_loop().time() - t_episode_start
 
     denom = turn  # turns actually executed (loop variable persists post-loop)
+
+    # Error recovery rate: of the error turns that had a following turn, what
+    # fraction were followed by a non-error turn (agent got unstuck). None if
+    # there were no recoverable errors.
+    eligible = 0
+    recovered = 0
+    for i in range(len(error_flags) - 1):
+        if error_flags[i]:
+            eligible += 1
+            if not error_flags[i + 1]:
+                recovered += 1
+    error_recovery_rate = (recovered / eligible) if eligible else None
+
     trajectory = {
         "n_valid_actions": n_valid,
         "n_invalid_actions": n_invalid,
@@ -248,8 +295,10 @@ async def run_episode(
         "n_repeated_actions": n_repeat,
         "action_validity_rate": (n_valid / denom) if denom else 0.0,
         "error_rate": (n_error_obs / denom) if denom else 0.0,
+        "error_recovery_rate": error_recovery_rate,
         "turns_to_submit": turns_to_submit,      # None if never submitted
         "cache_hit_rate_by_turn": cache_hit_rate_by_turn,
+        "reusable_prefix_by_turn": reusable_prefix_by_turn,
     }
 
     return EpisodeResult(
