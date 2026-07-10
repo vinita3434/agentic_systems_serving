@@ -267,7 +267,8 @@ class VLLMClient:
 
 
 async def preflight_serving_check(base_url: str, serving_cfg: dict,
-                                  timeout: float = 5.0) -> list[str]:
+                                  timeout: float = 5.0,
+                                  api_key: str = "EMPTY") -> list[str]:
     """Sanity-check that the server at base_url plausibly matches the
     serving config we were asked to run. Returns a list of human-readable
     warnings (empty == everything checks out).
@@ -293,7 +294,11 @@ async def preflight_serving_check(base_url: str, serving_cfg: dict,
     expected_model = serving_cfg.get("model")
     warnings: list[str] = []
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    # Auth header — vLLM servers can require an API key; match what the
+    # VLLMClient sends so the preflight isn't rejected with 401.
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
         # 1. Reachability + served model id.
         try:
             resp = await client.get(f"{v1}/models")
