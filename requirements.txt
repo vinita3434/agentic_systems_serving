@@ -6,8 +6,10 @@ tiktoken>=0.7.0
 # falls back to a char estimate if absent.
 transformers>=4.44.0
 
-# Real SWE-bench tasks (Phase 2). Pulled in by setup_runpod.sh on the pod.
-# Local installs are optional; uncomment if you want to develop SWE-bench
-# code paths on your laptop.
+# Real SWE-bench tasks (Phase 2). Task execution drives Docker directly via
+# the docker SDK + swebench instance images (no SWE-agent dependency).
+# Install these on the x86_64 box that runs the harness with a live Docker:
+#   pip install datasets>=2.20 swebench>=4.0 docker>=7.0
 # datasets>=2.20
-# sweagent>=1.0
+# swebench>=4.0
+# docker>=7.0

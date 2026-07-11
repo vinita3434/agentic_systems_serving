@@ -31,6 +31,7 @@ class SWEBenchTask:
     test_patch: str = ""
     patch: str = ""         # the gold patch (used only for evaluation)
     difficulty: str = ""    # Verified-split annotation, e.g. "1-4 hours"
+    raw: dict = None        # full dataset row; needed by swebench make_test_spec
 
     def as_task(self):
         """Convert to the lightweight Task used by agent_loop.run_episode."""
@@ -123,5 +124,6 @@ def load_swebench_tasks(split: str = "full",
             test_patch=row.get("test_patch", ""),
             patch=row.get("patch", ""),
             difficulty=row.get("difficulty", ""),
+            raw=dict(row),
         ))
     return out

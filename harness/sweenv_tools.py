@@ -1,208 +1,216 @@
 """
-SWEEnv adapter — Phase 2 tool execution against real SWE-bench tasks.
+Docker task-execution layer — Phase 2 tools against real SWE-bench tasks.
 
-Wraps princeton-nlp/SWE-agent's SWEEnv inside the harness.tools.Tools
-interface (parse_action + execute), so the same agent_loop.py works
-verbatim whether tools=MockTools() or tools=SWEEnvTools(task).
+Drives Docker DIRECTLY via the docker SDK + SWE-bench's own instance images.
+No SWE-agent dependency: SWE-agent 1.x is a CLI app (not library-importable)
+and its API drifts, so we own the container lifecycle ourselves. This keeps
+the custom agent loop, orchestration strategies, and metrics fully intact —
+only the "run bash in a container" primitive lives here.
 
-SWE-agent's API has shifted across versions; this adapter is defensive
-about imports and method names. Tested against sweagent >= 1.0.
+Per task:
+  * start()          pull the SWE-bench instance image (repo already at
+                     base_commit + deps installed under /testbed) and launch
+                     a long-lived container.
+  * execute(action)  run the agent's bash command inside that container.
+  * evaluate_patch() collect the working-tree diff and run swebench's
+                     run_instance() to get resolved True/False.
+  * close()          stop + remove the container.
 
-Lifecycle:
-    tools = SWEEnvTools.from_swebench(task)
-    tools.start()        # launches docker container, checks out base_commit
-    ... use tools.execute(action) in the agent loop ...
-    tools.close()        # cleanup
+Interface (parse_action + execute + evaluate_patch) is identical to
+MockTools, so agent_loop.py is unchanged.
 
-Or use as an async context manager:
-    async with SWEEnvTools.from_swebench(task) as tools:
-        ...
+Requires (on the box that runs the harness): a working Docker daemon,
+`pip install docker swebench`, and x86_64 (SWE-bench images are x86).
 """
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Optional
 
-from harness.tools import Action, Observation, parse_action  # re-exported for convenience
+from harness.tools import Action, Observation, parse_action  # re-exported
+
+
+WORKDIR = "/testbed"  # SWE-bench images check the repo out here
 
 
 class SWEEnvTools:
-    """
-    Tools that execute against a real SWEEnv. The class is intentionally
-    small — it delegates everything heavy to SWEEnv. The agent loop sees
-    the same .execute(action) interface as MockTools.
+    """Tools backed by a SWE-bench Docker container. Same .execute()/
+    .evaluate_patch() surface as MockTools."""
 
-    parse_action is re-exported from harness.tools so callers don't have
-    to know about two parsers.
-    """
-
-    def __init__(self, swe_task: Any, env_kwargs: Optional[dict] = None,
-                 command_timeout: float = 120.0):
+    def __init__(self, swe_task: Any, command_timeout: float = 120.0,
+                 namespace: str = "swebench", arch: str = "x86_64",
+                 image_override: Optional[str] = None):
         self.swe_task = swe_task
-        self.env_kwargs = env_kwargs or {}
         self.command_timeout = command_timeout
-        self._env = None  # SWEEnv instance, created in start()
+        self.namespace = namespace
+        self.arch = arch
+        self.image_override = image_override
+        self._client = None       # docker.DockerClient
+        self._container = None
+        self._test_spec = None
 
     # ----- construction -----
 
     @classmethod
-    def from_swebench(cls, swebench_task, **env_kwargs) -> "SWEEnvTools":
-        """Build SWEEnvTools from a SWEBenchTask (harness.swebench_tasks)."""
-        return cls(swe_task=swebench_task, env_kwargs=env_kwargs)
+    def from_swebench(cls, swebench_task, **kwargs) -> "SWEEnvTools":
+        return cls(swe_task=swebench_task, **kwargs)
+
+    def _make_test_spec(self):
+        if self._test_spec is None:
+            from swebench.harness.test_spec.test_spec import make_test_spec
+            instance = self.swe_task.raw or {}
+            self._test_spec = make_test_spec(
+                instance, namespace=self.namespace, arch=self.arch)
+        return self._test_spec
+
+    def _instance_image(self) -> str:
+        if self.image_override:
+            return self.image_override
+        return self._make_test_spec().instance_image_key
 
     # ----- lifecycle -----
 
     def start(self) -> None:
-        """Launch the underlying SWE-agent environment.
-
-        Performs the import lazily so the rest of the harness can run
-        without sweagent installed.
-        """
-        if self._env is not None:
+        """Pull the instance image (if needed) and launch a container that
+        idles so we can exec commands into it."""
+        if self._container is not None:
             return
-        try:
-            # Recent sweagent versions
-            from sweagent.environment.swe_env import SWEEnv  # type: ignore
-            from sweagent.environment.config import EnvironmentArguments  # type: ignore
-        except ImportError as e:
-            raise ImportError(
-                "SWEEnvTools requires princeton-nlp/SWE-agent. "
-                "Install with: pip install sweagent  "
-                "(or follow https://github.com/princeton-nlp/SWE-agent for the latest setup)."
-            ) from e
+        import docker
+        from docker.errors import ImageNotFound
 
-        # SWE-agent constructs SWEEnv from EnvironmentArguments; pass through
-        # any kwargs the caller provided.
-        env_args = EnvironmentArguments(
-            data_path=self._build_data_path(),
-            repo_path="",                       # SWEEnv resolves from instance
-            container_name=f"swe-{self.swe_task.instance_id}",
-            image_name=self.env_kwargs.get("image_name", "sweagent/swe-agent:latest"),
-            **{k: v for k, v in self.env_kwargs.items() if k != "image_name"},
+        self._client = docker.from_env()
+        image = self._instance_image()
+        try:
+            self._client.images.get(image)
+        except ImageNotFound:
+            # SWE-bench publishes instance images under the 'swebench' Docker
+            # Hub namespace. If this instance's image isn't published, it must
+            # be built first (swebench.harness build utilities).
+            print(f"[SWEEnvTools] pulling {image} ...")
+            self._client.images.pull(image)
+
+        self._container = self._client.containers.run(
+            image,
+            command=["sleep", "infinity"],
+            detach=True,
+            working_dir=WORKDIR,
+            tty=False,
+            network_mode="none",   # tasks shouldn't need network; keeps it hermetic
+            auto_remove=False,
         )
-        self._env = SWEEnv(env_args)
-        self._env.reset()  # checks out base_commit, installs deps
 
     def close(self) -> None:
-        if self._env is not None:
+        if self._container is not None:
             try:
-                self._env.close()
+                self._container.remove(force=True)
             finally:
-                self._env = None
-
-    def _build_data_path(self) -> str:
-        """SWE-agent expects either a HF dataset name or a local JSONL.
-        We pass the instance_id and let SWE-agent pull from SWE-bench."""
-        # princeton-nlp/SWE-bench shorthand SWE-agent understands.
-        return f"princeton-nlp/SWE-bench__{self.swe_task.instance_id}"
+                self._container = None
+        if self._client is not None:
+            try:
+                self._client.close()
+            finally:
+                self._client = None
 
     # ----- async context manager -----
 
     async def __aenter__(self) -> "SWEEnvTools":
+        import asyncio
         await asyncio.get_running_loop().run_in_executor(None, self.start)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        import asyncio
         await asyncio.get_running_loop().run_in_executor(None, self.close)
 
-    # ----- tools interface -----
+    # ----- command execution -----
+
+    def _exec(self, command: str) -> str:
+        """Run a shell command in the container, bounded by command_timeout
+        (enforced with coreutils `timeout` so a hung command can't stall the
+        episode). Returns combined stdout+stderr."""
+        if self._container is None:
+            raise RuntimeError("SWEEnvTools not started. Call start() first.")
+        cmd = ["timeout", str(int(self.command_timeout)), "bash", "-c", command]
+        res = self._container.exec_run(cmd=cmd, workdir=WORKDIR, demux=False)
+        out = res.output
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "replace")
+        if res.exit_code == 124:
+            out = (out or "") + f"\n[command timed out after {int(self.command_timeout)}s]"
+        return out or ""
 
     def execute(self, action: Action) -> Observation:
-        """Synchronous execute — matches MockTools.execute. The agent_loop
-        already runs this in an executor where the LLM call is async."""
-        if self._env is None:
-            raise RuntimeError("SWEEnvTools not started. Call start() first.")
-
+        """Synchronous execute — matches MockTools.execute; agent_loop runs
+        it in an executor."""
         if action.kind == "submit":
-            # SWE-agent uses 'submit' as a sentinel; the env will diff the
-            # working tree against base_commit and return the patch.
-            try:
-                patch = self._env.submit() or ""
-            except Exception as e:
-                return Observation(content=f"<output>\n[submit failed: {e}]\n</output>",
-                                   is_terminal=True)
-            return Observation(content=f"<output>\nPatch submitted.\n{patch}\n</output>",
+            patch = self._collect_patch()
+            body = "Patch submitted." if patch else "Patch submitted (empty diff)."
+            return Observation(content=f"<output>\n{body}\n</output>",
                                is_terminal=True)
-
         try:
-            stdout = self._env.communicate(
-                input=action.command, timeout_duration=self.command_timeout)
+            stdout = self._exec(action.command)
         except Exception as e:
             return Observation(content=f"<output>\n[error: {e}]\n</output>")
-
         return Observation(content=f"<output>\n{stdout}\n</output>")
 
-    # ----- patch evaluation -----
+    # ----- patch collection + evaluation -----
+
+    def _collect_patch(self) -> str:
+        """The agent's changes as a unified diff, including new files."""
+        try:
+            self._exec("git add -A")
+            return self._exec("git diff --cached")
+        except Exception as e:
+            print(f"[SWEEnvTools._collect_patch error: {e}]")
+            return ""
 
     def evaluate_patch(self) -> Optional[bool]:
-        """Run the SWE-bench evaluation harness on the current patch.
+        """Run swebench's single-instance evaluator on the agent's patch.
 
-        Returns True if the task's tests pass under the agent's patch,
-        False if they don't, None if evaluation could not be run.
-
-        Shells out to `swebench.harness.run_evaluation` because that
-        module owns the per-instance Docker test container lifecycle.
-        Per-episode cost is meaningful (30–120 s typical); call only when
-        an evaluation result is actually wanted.
+        Returns True if the task's hidden tests pass under the patch, False if
+        not, None if evaluation could not be run. Fails open.
         """
-        if self._env is None:
-            return None
         try:
             patch = self._collect_patch()
-            if not patch:
+            if not patch.strip():
                 return False
-            return self._run_swebench_evaluator(patch)
+
+            import docker
+            from swebench.harness.run_evaluation import run_instance
+
+            instance_id = self.swe_task.instance_id
+            pred = {
+                "instance_id": instance_id,
+                "model_patch": patch,
+                "model_name_or_path": "agentic_systems_serving",
+            }
+            test_spec = self._make_test_spec()
+            client = self._client or docker.from_env()
+            run_id = f"eval_{instance_id}"
+
+            report = run_instance(
+                test_spec, pred,
+                rm_image=False, force_rebuild=False,
+                client=client, run_id=run_id,
+                timeout=1800,
+            )
+            return _extract_resolved(report, instance_id)
         except Exception as e:
             print(f"[SWEEnvTools.evaluate_patch error: {e}]")
             return None
 
-    def _collect_patch(self) -> str:
-        """SWEEnv exposes the working-tree diff via submit() or get_patch().
-        The exact method has shifted across sweagent releases; try both."""
-        for attr in ("get_patch", "submit"):
-            fn = getattr(self._env, attr, None)
-            if callable(fn):
-                try:
-                    out = fn()
-                except TypeError:
-                    out = fn(None)  # some versions take an arg
-                if out:
-                    return out
-        return ""
 
-    def _run_swebench_evaluator(self, patch: str) -> Optional[bool]:
-        import json
-        import subprocess
-        import sys
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
-                                          delete=False) as f:
-            json.dump([{
-                "instance_id": self.swe_task.instance_id,
-                "model_patch": patch,
-                "model_name_or_path": "agentic_systems_serving",
-            }], f)
-            predictions_path = f.name
-
-        run_id = f"eval_{self.swe_task.instance_id}"
-        cmd = [sys.executable, "-m", "swebench.harness.run_evaluation",
-               "--predictions_path", predictions_path,
-               "--instance_ids", self.swe_task.instance_id,
-               "--max_workers", "1",
-               "--run_id", run_id]
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=600)
-        # The harness prints a summary that includes "resolved" instances.
-        # We parse loosely; if the harness changes its output format, this
-        # returns None and the sweep still completes.
-        text = (result.stdout or "") + "\n" + (result.stderr or "")
-        if self.swe_task.instance_id in text and "resolved" in text.lower():
-            # Heuristic: look for "Instances resolved: N" or "resolved_ids"
-            # containing our instance.
-            if f'"{self.swe_task.instance_id}"' in text or \
-               f"'{self.swe_task.instance_id}'" in text:
-                return True
-            return False
+def _extract_resolved(report: Any, instance_id: str) -> Optional[bool]:
+    """Pull the boolean resolved status out of run_instance's report dict,
+    defensively (its shape has shifted across swebench versions)."""
+    if not isinstance(report, dict):
         return None
+    node = report.get(instance_id, report)
+    if isinstance(node, dict):
+        if "resolved" in node:
+            return bool(node["resolved"])
+        # some versions nest under the instance id twice or under 'report'
+        for v in node.values():
+            if isinstance(v, dict) and "resolved" in v:
+                return bool(v["resolved"])
+    return None
