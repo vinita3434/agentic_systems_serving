@@ -72,13 +72,15 @@ import argparse
 import asyncio
 import itertools
 import json
+import os
 import time
 from pathlib import Path
 
 import yaml
 
 from harness.agent_loop import DEFAULT_MOCK_TASK, Task, run_episode
-from harness.llm_client import MockLLMClient, VLLMClient, preflight_serving_check
+from harness.llm_client import (MockLLMClient, VLLMClient, preflight_serving_check,
+                                resolve_base_url)
 from harness.metrics_logger import MetricsLogger
 from harness.tools import MockTools
 
@@ -375,9 +377,12 @@ def serving_base_url(serving_cfg: dict, override: str | None) -> str:
 
     Note: we always connect to localhost — the config's `host` (0.0.0.0)
     is the server's *bind* address, not a client connect address.
+
+    An explicit --vllm-base-url override or the LLM_BASE_URL env var takes
+    precedence over the per-config port (single-box: one server on :8000).
     """
-    if override:
-        return override
+    if override or os.environ.get("LLM_BASE_URL"):
+        return resolve_base_url(override)
     port = serving_cfg.get("port", 8000)
     return f"http://localhost:{port}/v1"
 
@@ -388,9 +393,44 @@ def make_llm_client(backend: str, serving_cfg: dict, vllm_base_url: str):
     if backend == "vllm":
         return VLLMClient(base_url=vllm_base_url,
                           model=serving_cfg.get("model",
-                                                "Qwen/Qwen2.5-Coder-7B-Instruct"),
+                                                "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"),
                           engine=serving_cfg.get("engine", "vllm"))
     raise ValueError(f"Unknown backend: {backend}")
+
+
+# ---------- resumability ---------------------------------------------------
+
+
+def completed_episode_keys(results_dir: Path) -> set[tuple[str, str, str]]:
+    """Scan prior per-episode logs and return the set of already-finished
+    (task_id, orchestration, serving) triples.
+
+    A per-episode row is written only after run_episode returns without
+    crashing, so a row's presence means that episode is DONE. This lets a
+    sweep resume: a crash at task 15/20 re-runs only tasks 15-20, never the
+    completed ones — zero repeated GPU work on restart. Keyed on the triple
+    (not experiment_id) because each restart mints a fresh time-based sweep_id.
+    """
+    done: set[tuple[str, str, str]] = set()
+    for path in results_dir.glob("*__episodes.jsonl"):
+        try:
+            with path.open() as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    tid, orch, serv = (row.get("task_id"),
+                                       row.get("orchestration"),
+                                       row.get("serving"))
+                    if tid and orch and serv:
+                        done.add((tid, orch, serv))
+        except OSError:
+            continue
+    return done
 
 
 # ---------- sweep ----------------------------------------------------------
@@ -420,13 +460,28 @@ async def run_sweep(args) -> list[dict]:
     tasks = load_tasks(args.task_source, args.swebench_split,
                        args.task_limit, args.task_id, hard_only=args.hard_only)
 
+    # Resumability: skip (task, orch, serving) triples already completed in a
+    # prior sweep. Disabled by --no-resume and during --calibrate (which needs
+    # fresh timings). See completed_episode_keys().
+    resume_enabled = not args.no_resume and not args.calibrate
+    done_keys = completed_episode_keys(RESULTS_DIR) if resume_enabled else set()
+
+    # Calibration: remember the full task count for projection, then run only
+    # the first N tasks. Projection scales by (full tasks x number of cells).
+    full_task_n = len(tasks)
+    if args.calibrate:
+        tasks = tasks[:args.calibrate]
+
     sweep_id = int(time.time())
     summaries: list[dict] = []
+    calib_samples: list[tuple[float, float]] = []  # (wall_s, gpu_cost_usd) per episode
 
     print(f"Sweep id:      {sweep_id}")
     print(f"Backend:       {args.backend}")
     print(f"Design:        {design_label}")
     print(f"GPU class:     {args.gpu_class}")
+    print(f"Resume:        {'on' if resume_enabled else 'off'} "
+          f"({len(done_keys)} completed episodes on disk will be skipped)")
     print(f"Task source:   {args.task_source} (n={len(tasks)})")
     print(f"Orchestrations: {list(orch_configs)}")
     print(f"Servings:       {list(serving_configs)}")
@@ -471,6 +526,11 @@ async def run_sweep(args) -> list[dict]:
         cell_turns_to_submit: list[int] = []
         cell_recovery_rates: list[float] = []
         for ep, task in enumerate(tasks):
+            if resume_enabled and (task.task_id, orch_cfg["name"],
+                                   serv_cfg["name"]) in done_keys:
+                print(f"  [skip ep={ep:<2} task={task.task_id}] already "
+                      f"completed on disk — resume")
+                continue
             base_url = serving_base_url(serv_cfg, args.vllm_base_url)
             llm_client = make_llm_client(args.backend, serv_cfg, base_url)
             tools = make_tools(args.task_source, task)
@@ -506,6 +566,9 @@ async def run_sweep(args) -> list[dict]:
                 cell_prompt_tokens += ep_result.total_prompt_tokens
                 cell_completion_tokens += ep_result.total_completion_tokens
                 cell_episodes += 1
+                calib_samples.append(
+                    (ep_result.wall_clock_s,
+                     ep_result.wall_clock_s * (args.gpu_hourly_usd / 3600.0)))
                 if ep_result.verified is True:
                     cell_verified += 1
                 tj = ep_result.trajectory or {}
@@ -519,6 +582,13 @@ async def run_sweep(args) -> list[dict]:
                 close = getattr(tools, "close", None)
                 if callable(close):
                     close()
+
+        if cell_episodes == 0:
+            # Every episode was skipped (resume) or none produced turns; there
+            # is nothing new to summarize. The prior run's rows are already on
+            # disk, so just move on rather than emit an empty/broken summary.
+            print("  all episodes already complete for this cell — skipped")
+            continue
 
         s = logger.summary()
         s["orchestration"] = orch_cfg["name"]
@@ -578,6 +648,10 @@ async def run_sweep(args) -> list[dict]:
               f"efficiency={('n/a' if _eff is None else f'{_eff:.2f}')} "
               f"(hit=used/sent, efficiency=used/reusable)")
 
+    if args.calibrate:
+        _print_calibration(calib_samples, full_task_n, len(cells), args)
+        return summaries
+
     summary_path = RESULTS_DIR / f"sweep{sweep_id}_summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     with summary_path.open("w") as f:
@@ -597,6 +671,50 @@ async def run_sweep(args) -> list[dict]:
 
 
 # ---------- output ---------------------------------------------------------
+
+
+def _print_calibration(samples: list[tuple[float, float]], full_task_n: int,
+                       n_cells: int, args) -> None:
+    """Report timing/cost from the calibration episodes and project the full
+    sweep. Projection assumes strictly sequential episodes (one at a time, per
+    the hard constraint) and that the full sweep starts now."""
+    import statistics
+    from datetime import datetime
+
+    print("\n" + "=" * 64)
+    print(f"CALIBRATION  ({len(samples)} episode(s) over "
+          f"{min(args.calibrate, full_task_n)} task(s) x {n_cells} cell(s))")
+    print("=" * 64)
+    if not samples:
+        print("  no episodes completed — cannot project. Check the serving "
+              "server and the smoke task first.")
+        print("=" * 64)
+        return
+
+    walls = [w for w, _ in samples]
+    costs = [c for _, c in samples]
+    mean_wall = statistics.mean(walls)
+    med_wall = statistics.median(walls)
+    mean_cost = statistics.mean(costs)
+
+    total_episodes = full_task_n * n_cells
+    proj_secs = mean_wall * total_episodes
+    proj_cost = mean_cost * total_episodes
+    finish = datetime.fromtimestamp(time.time() + proj_secs)
+
+    print(f"  mean   episode wall : {mean_wall:8.1f} s   ({mean_wall/60:5.1f} min)")
+    print(f"  median episode wall : {med_wall:8.1f} s   ({med_wall/60:5.1f} min)")
+    print(f"  mean   cost/episode : ${mean_cost:.4f}")
+    print(f"  gpu rate            : ${args.gpu_hourly_usd:.2f}/hr")
+    print("-" * 64)
+    print(f"  FULL SWEEP projection: {full_task_n} task(s) x {n_cells} "
+          f"cell(s) = {total_episodes} episodes")
+    print(f"  projected wall time : {proj_secs/3600:6.2f} h   "
+          f"({proj_secs/60:.0f} min)")
+    print(f"  projected total cost: ${proj_cost:.2f}")
+    print(f"  projected finish    : {finish:%Y-%m-%d %H:%M:%S}  "
+          f"(if the full sweep starts now, sequential)")
+    print("=" * 64)
 
 
 _ROLE_ORDER = {
@@ -683,6 +801,20 @@ def main():
     p.add_argument("--skip-serving-check", action="store_true",
                    help="Skip the startup check that the running engine "
                         "matches the --serving config (vllm backend only).")
+    p.add_argument("--no-resume", action="store_true",
+                   help="Disable resume. By default the sweep skips any "
+                        "(task, orchestration, serving) episode already present "
+                        "in experiments/results/*__episodes.jsonl, so a crash "
+                        "mid-sweep costs zero repeated episodes on restart.")
+    p.add_argument("--calibrate", type=int, default=0, metavar="N",
+                   help="Calibration mode: run only the first N tasks, print "
+                        "timing/cost projections for the full task list, then "
+                        "exit. Implies --no-resume (needs fresh timings).")
+    p.add_argument("--shutdown-on-complete", action="store_true",
+                   help="After the sweep finishes, run 'sudo shutdown -h +5' so "
+                        "an overnight run doesn't idle-bill the GPU box. Default "
+                        "off. Cancel within the 5 min with 'sudo shutdown -c'. "
+                        "Ignored under --calibrate.")
     # Cost accounting (per episode JSONL gets gpu_cost_usd + api_equiv_cost_usd).
     p.add_argument("--gpu-hourly-usd", type=float, default=1.40,
                    help="Rental cost of the GPU $/hr. Default 1.40 (A100 SXM, RunPod).")
@@ -692,6 +824,20 @@ def main():
                    help="Hosted-API equivalent output token cost in $ per 1M tokens.")
     args = p.parse_args()
     asyncio.run(run_sweep(args))
+
+    # Optional auto-stop for unattended overnight runs. Only after a real sweep
+    # (never during --calibrate). shutdown() itself needs sudo; on a non-Linux
+    # box (e.g. a laptop dry-run) the binary/permission may be absent — warn,
+    # don't crash, so the results are never lost to a shutdown hiccup.
+    if args.shutdown_on_complete and not args.calibrate:
+        import subprocess
+        print("\n[--shutdown-on-complete] sweep finished; scheduling "
+              "'sudo shutdown -h +5'.")
+        print("  Cancel within 5 minutes with:  sudo shutdown -c")
+        try:
+            subprocess.run(["sudo", "shutdown", "-h", "+5"], check=False)
+        except FileNotFoundError:
+            print("  NOTE: 'shutdown' not found — skipping (not a Linux host?).")
 
 
 if __name__ == "__main__":

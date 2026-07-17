@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -29,6 +30,25 @@ import httpx
 
 
 Message = dict[str, Any]
+
+# Single-box default: the harness and vLLM run on the same EC2 instance, so the
+# server is reachable over localhost with no network hop (the old RunPod split
+# went through a public proxy URL — that's gone). Override precedence:
+#   1. an explicit base_url argument (e.g. --vllm-base-url)
+#   2. the LLM_BASE_URL environment variable
+#   3. this default
+DEFAULT_BASE_URL = "http://localhost:8000"
+
+
+def resolve_base_url(override: Optional[str] = None) -> str:
+    """Resolve the vLLM server URL from (in order) an explicit override, the
+    LLM_BASE_URL env var, then DEFAULT_BASE_URL. A trailing ``/v1`` is ensured
+    so the OpenAI-compatible request paths resolve regardless of which form the
+    caller supplied."""
+    url = (override or os.environ.get("LLM_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+    if not url.endswith("/v1"):
+        url += "/v1"
+    return url
 
 
 @dataclass
@@ -127,15 +147,20 @@ class MockLLMClient:
 
 
 class VLLMClient:
-    """OpenAI-compatible streaming client. Use this once a real vLLM server
-    is running (Phase 2 on RunPod)."""
+    """OpenAI-compatible streaming client for a real vLLM server. On the AWS
+    single box the server is colocated, so base_url resolves to localhost via
+    resolve_base_url (LLM_BASE_URL overrides it)."""
 
-    def __init__(self, base_url: str = "http://localhost:8000/v1",
-                 model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+    def __init__(self, base_url: Optional[str] = None,
+                 model: str = "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ",
                  api_key: str = "EMPTY",
                  timeout: float = 300.0,
                  engine: str = "vllm"):
-        self.base_url = base_url.rstrip("/")
+        # 300s request timeout kept intentionally: hard SWE-bench turns with
+        # long prefills legitimately run long. (There are no proxy-specific
+        # timeout workarounds to remove — the old RunPod path added none; it
+        # just used this same client over a proxy URL.)
+        self.base_url = resolve_base_url(base_url)
         self.model = model
         self.engine = engine
         self.headers = {"Authorization": f"Bearer {api_key}",

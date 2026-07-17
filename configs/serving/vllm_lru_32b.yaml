@@ -1,0 +1,23 @@
+name: vllm_lru_32b
+engine: vllm
+description: |
+  Same LRU prefix-caching baseline as vllm_lru, but serving the larger
+  Qwen2.5-Coder-32B-Instruct (AWQ 4-bit). The 7B never submitted a patch
+  in 40 turns; 32B is the capability step-up. AWQ (~20GB weights) fits a
+  48GB GPU (A6000 / L40 / L40S) with room for KV cache, or runs on A100 80GB.
+gpu_classes: [A100, H100]
+model: Qwen/Qwen2.5-Coder-32B-Instruct-AWQ
+host: 0.0.0.0
+port: 8000
+flags:
+  quantization: awq_marlin
+  enable_prefix_caching: true
+  enable_chunked_prefill: true
+  dtype: float16          # AWQ runs in fp16, not bf16
+  gpu_memory_utilization: 0.92
+  max_model_len: 32768
+  max_num_batched_tokens: 2048
+  max_num_seqs: 32
+extra_args:
+  - "--enable-auto-tool-choice"
+  - "--tool-call-parser=hermes"
