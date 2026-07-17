@@ -4,7 +4,9 @@ pyyaml>=6.0
 tiktoken>=0.7.0
 # Real model tokenizer for exact reusable-prefix (R_n) token counts;
 # falls back to a char estimate if absent.
-transformers>=4.44.0
+# Upper-capped: transformers >=4.48 drops Qwen2Tokenizer.all_special_tokens_extended,
+# which pinned vLLM 0.6.6 calls at startup -> serve crashes. Keep <4.48.
+transformers>=4.44.0,<4.48
 
 # Real SWE-bench tasks (Phase 2). Task execution drives Docker directly via
 # the docker SDK + swebench instance images (no SWE-agent dependency).

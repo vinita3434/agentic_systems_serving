@@ -67,7 +67,10 @@ echo "docker ok: $(docker --version)"
 # Dedicated venv — never install into the DLAMI conda base (it drifts and is
 # shared). Creating a venv over an existing one is a no-op, so re-runs are safe.
 say 3 "Python env @ $VENV"
-if [[ ! -x "$VENV/bin/python" ]]; then
+# Check for pip, not just python: a venv whose ensurepip failed leaves a bin/python
+# but no bin/pip, and reusing it breaks the install below. Rebuild if pip is missing.
+if [[ ! -x "$VENV/bin/pip" ]]; then
+    rm -rf "$VENV"
     python3 -m venv "$VENV"
 else
     echo "reusing existing venv (idempotent)"
@@ -75,8 +78,10 @@ fi
 "$VENV/bin/pip" install -q --upgrade pip wheel setuptools
 # Pinned vLLM (bundles a matching CUDA torch), plus eval + dataset + docker SDK.
 # hf_transfer gives the Rust-accelerated downloader used by the env var above.
+# transformers <4.48: newer releases drop Qwen2Tokenizer.all_special_tokens_extended
+# which pinned vLLM 0.6.6 calls at startup (serve crashes otherwise).
 "$VENV/bin/pip" install -q "vllm==${VLLM_VERSION}" 'hf_transfer' 'swebench' \
-    'datasets>=2.20' 'docker' 'httpx' 'pyyaml' 'transformers'
+    'datasets>=2.20' 'docker' 'httpx' 'pyyaml' 'transformers<4.48'
 
 # ---- 4. get the repo -------------------------------------------------------
 say 4 "Repo @ $REPO_DIR"
@@ -168,7 +173,3 @@ echo
 echo "(--serving vllm_lru_32b already targets localhost:$PORT and the 32B model,"
 echo " so no --vllm-base-url is needed. Re-running this script is safe: the venv"
 echo " is reused and weights are cached in $HF_HOME — no 20GB re-download.)"
-echo
-echo "NOTE: --serving vllm_lru's YAML still pins the 7B model name; the preflight"
-echo "will warn 'served model != config model'. That's cosmetic on one box —"
-echo "or point it at a 32B serving config once we add one."
