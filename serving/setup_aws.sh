@@ -67,6 +67,13 @@ echo "docker ok: $(docker --version)"
 # Dedicated venv — never install into the DLAMI conda base (it drifts and is
 # shared). Creating a venv over an existing one is a no-op, so re-runs are safe.
 say 3 "Python env @ $VENV"
+# Some base images ship python3 without ensurepip, so `python3 -m venv` fails
+# ("ensurepip is not available"). Install the venv package before creating one.
+if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
+    echo "ensurepip missing — installing python3-venv..."
+    sudo apt-get update -qq && sudo apt-get install -y python3-venv \
+        || sudo apt-get install -y "python$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')-venv"
+fi
 # Check for pip, not just python: a venv whose ensurepip failed leaves a bin/python
 # but no bin/pip, and reusing it breaks the install below. Rebuild if pip is missing.
 if [[ ! -x "$VENV/bin/pip" ]]; then
