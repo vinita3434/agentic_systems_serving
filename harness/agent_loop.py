@@ -29,6 +29,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Optional, Callable
 
+import httpx
+
 from harness.context_manager import assemble, Message, messages_tokens
 from harness.llm_client import CompletionResult
 from harness.metrics_logger import MetricsLogger, TurnMetrics
@@ -270,9 +272,22 @@ async def run_episode(
         prev_prompt_text = prompt_text
         reusable_prefix_by_turn.append(reusable_prefix_tokens)
 
-        result: CompletionResult = await llm_client.chat(
-            assembled.messages, max_tokens=512, temperature=0.0
-        )
+        try:
+            result: CompletionResult = await llm_client.chat(
+                assembled.messages, max_tokens=512, temperature=0.0
+            )
+        except httpx.HTTPStatusError as e:
+            # A 400 here is almost always the prompt exceeding the model's
+            # max context length — full-context strategies (full_context,
+            # cache_aware_ordering) grow unbounded on long trajectories. End
+            # the episode gracefully (keep whatever edits were made, then
+            # evaluate) instead of crashing the whole sweep.
+            code = e.response.status_code
+            print(f"[episode {episode_idx}: server returned {code} at turn "
+                  f"{turn} — likely context-length overflow; ending episode "
+                  f"and evaluating the patch so far]")
+            last_finish_reason = "context_overflow" if code == 400 else f"http_{code}"
+            break
 
         metrics_logger.log(TurnMetrics(
             experiment_id=metrics_logger.experiment_id,
