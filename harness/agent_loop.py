@@ -235,13 +235,17 @@ async def run_episode(
     strategy = orchestration_cfg["strategy"]
     params = orchestration_cfg.get("params") or {}
 
-    # Synchronous adapter for the summarization strategy. The strategy
-    # function expects a sync callable; we bridge to the async llm_client
-    # via a fresh event loop call.
+    # Synchronous adapter for the summarization strategy. assemble() calls this
+    # synchronously, but we're already inside a running event loop (run_episode
+    # is async), so run_until_complete on the current loop is illegal. Run the
+    # async summarizer in a separate thread with its own event loop and block
+    # for the result.
     def _sync_summarizer(msgs: list[Message]) -> str:
-        return asyncio.get_event_loop().run_until_complete(
-            _summarize_via_llm(llm_client, msgs)
-        )
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(
+                lambda: asyncio.run(_summarize_via_llm(llm_client, msgs))
+            ).result()
 
     completed = False
     last_finish_reason = None
