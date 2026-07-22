@@ -533,8 +533,9 @@ async def run_sweep(args) -> list[dict]:
                 continue
             base_url = serving_base_url(serv_cfg, args.vllm_base_url)
             llm_client = make_llm_client(args.backend, serv_cfg, base_url)
-            tools = make_tools(args.task_source, task)
+            tools = None
             try:
+                tools = make_tools(args.task_source, task)
                 ep_result = await run_episode(
                     task=task,
                     orchestration_cfg=orch_cfg,
@@ -578,10 +579,20 @@ async def run_sweep(args) -> list[dict]:
                     cell_turns_to_submit.append(tj["turns_to_submit"])
                 if tj.get("error_recovery_rate") is not None:
                     cell_recovery_rates.append(tj["error_recovery_rate"])
+            except Exception as e:
+                # Isolate per-task failures (Docker pull/exec errors, tool
+                # setup, unexpected model output, etc.) so ONE bad task can't
+                # abort the whole sweep. It's skipped (no episode row), and
+                # resume will retry it on the next run.
+                print(f"  [task {task.task_id} FAILED: {type(e).__name__}: {e} "
+                      f"— skipping; sweep continues]")
             finally:
                 close = getattr(tools, "close", None)
                 if callable(close):
-                    close()
+                    try:
+                        close()
+                    except Exception:
+                        pass
 
         if cell_episodes == 0:
             # Every episode was skipped (resume) or none produced turns; there
