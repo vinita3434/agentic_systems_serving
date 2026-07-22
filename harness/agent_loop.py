@@ -36,20 +36,51 @@ from harness.tools import Action, Observation, parse_action
 
 
 SYSTEM_PROMPT = (
-    "You are an autonomous software engineering agent working inside a real "
-    "code repository. Your current working directory is the repository root, "
-    "and the bug to fix is described in the task below.\n\n"
-    "Work step by step, issuing ONE bash command per turn, each inside a single "
-    "fenced ```bash``` block:\n"
-    "1. Explore the codebase (e.g. ls, cat, grep) to find the relevant files.\n"
-    "2. Locate and understand the cause of the bug.\n"
-    "3. Edit the file(s) to fix it (e.g. with sed, or by rewriting the file).\n"
-    "4. Run the project's tests to verify your change.\n"
-    "5. Only after you have made AND verified a fix, run `submit`.\n\n"
-    "Rules: respond with exactly one bash command in one ```bash``` block per "
-    "turn. Do NOT run `submit` on the first turn, and never submit before you "
-    "have actually edited a file — an empty submission fails the task. Think "
-    "step by step and keep responses concise."
+    "You are an autonomous software engineering agent fixing a bug in a real "
+    "repository. Your working directory is the repository root.\n\n"
+    "You interact with the codebase through a special command interface. Each "
+    "turn: first write a short DISCUSSION of your reasoning, then issue EXACTLY "
+    "ONE command inside a single fenced ``` block. Available commands:\n"
+    "  open <path> [line]         open a file (shows a numbered window)\n"
+    "  goto <line>                move the window to a line\n"
+    "  scroll_down | scroll_up    page through the open file\n"
+    "  search_dir <term> [dir]    search a term across files\n"
+    "  search_file <term> [file]  search within the open file\n"
+    "  find_file <name> [dir]     find files by name\n"
+    "  create <path>              create a new file\n"
+    "  edit <start>:<end> <<'EOF'\n  <new lines>\n  EOF   replace inclusive line "
+    "range start..end in the open file\n"
+    "  <any shell command>        you may also run normal shell commands and tests\n"
+    "  submit                     submit your solution\n\n"
+    "Workflow: explore to locate the buggy code, open the file, edit it to fix "
+    "the bug, run the project's tests to verify, then submit. Do NOT run "
+    "`submit` on the first turn or before you have edited a file and confirmed "
+    "the fix — an empty submission fails the task. One command per turn."
+)
+
+
+# A one-shot demonstration on a DIFFERENT toy bug, prepended to the first user
+# message. Shows the exact expected format (DISCUSSION + one fenced command)
+# and the explore -> open -> edit -> test -> submit workflow. Static text, so
+# it's part of the stable prompt prefix (prefix-cache friendly) and is not
+# counted as a real turn.
+DEMONSTRATION = (
+    "Here is a short demonstration of the workflow on a DIFFERENT example bug "
+    "(one command per turn):\n\n"
+    "DISCUSSION\nFind where the function is defined.\n"
+    "```\nsearch_dir \"def add_numbers\"\n```\n"
+    "OBSERVATION\n./calc/ops.py:12:def add_numbers(a, b):\n\n"
+    "DISCUSSION\nOpen the file at that line.\n```\nopen calc/ops.py 12\n```\n"
+    "OBSERVATION\n[File: calc/ops.py (30 lines total)]\n12:def add_numbers(a, b):\n"
+    "13:    return a - b\n\n"
+    "DISCUSSION\nThe bug: it subtracts instead of adds. Fix line 13.\n"
+    "```\nedit 13:13 <<'EOF'\n    return a + b\nEOF\n```\n"
+    "OBSERVATION\n[File: calc/ops.py edited: lines 13-13 replaced]\n\n"
+    "DISCUSSION\nRun the tests to verify.\n"
+    "```\npython -m pytest tests/test_ops.py -q\n```\n"
+    "OBSERVATION\n1 passed\n\n"
+    "DISCUSSION\nThe fix is verified. Submit.\n```\nsubmit\n```\n\n"
+    "Now solve the ACTUAL task below the same way.\n"
 )
 
 
@@ -194,7 +225,8 @@ async def run_episode(
 
     history: list[Message] = [
         {"role": "system", "content": SYSTEM_PROMPT, "meta": {"kind": "system"}},
-        {"role": "user", "content": f"<task>\n{task.description}\n</task>",
+        {"role": "user",
+         "content": f"{DEMONSTRATION}\n<task>\n{task.description}\n</task>",
          "meta": {"kind": "task"}},
     ]
 

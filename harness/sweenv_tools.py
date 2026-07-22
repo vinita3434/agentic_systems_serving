@@ -98,6 +98,21 @@ class SWEEnvTools:
             network_mode="none",   # tasks shouldn't need network; keeps it hermetic
             auto_remove=False,
         )
+        self._install_aci()
+
+    def _install_aci(self) -> None:
+        """Copy the SWE-agent-style ACI command script into the container and
+        clear any stale state. The commands (open/goto/edit/search/…) are then
+        available to the agent by sourcing /root/aci.sh in each exec. State is
+        file-backed (/root/.aci_state) because each exec is a fresh shell."""
+        import base64
+        import pathlib
+        aci = pathlib.Path(__file__).with_name("aci.sh").read_bytes()
+        b64 = base64.b64encode(aci).decode()
+        self._container.exec_run(
+            cmd=["bash", "-c",
+                 f"echo {b64} | base64 -d > /root/aci.sh && rm -f /root/.aci_state"],
+        )
 
     def close(self) -> None:
         if self._container is not None:
@@ -130,7 +145,11 @@ class SWEEnvTools:
         episode). Returns combined stdout+stderr."""
         if self._container is None:
             raise RuntimeError("SWEEnvTools not started. Call start() first.")
-        cmd = ["timeout", str(int(self.command_timeout)), "bash", "-c", command]
+        # Source the ACI so the agent's open/goto/edit/search commands resolve.
+        # Cheap (a few KB) and keeps the exec stateless — ACI state lives in a
+        # file, not this shell.
+        wrapped = f"source /root/aci.sh 2>/dev/null; {command}"
+        cmd = ["timeout", str(int(self.command_timeout)), "bash", "-c", wrapped]
         res = self._container.exec_run(cmd=cmd, workdir=WORKDIR, demux=False)
         out = res.output
         if isinstance(out, bytes):
