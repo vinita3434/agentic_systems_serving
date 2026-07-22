@@ -224,6 +224,13 @@ class VLLMClient:
             ttft_ms = total_ms  # no streamed tokens
 
         cache_hit_tokens, cache_hit_rate = await self._fetch_cache_stats()
+        # Gauge-based engines (vLLM 0.6.x) report only a hit-RATE, no per-request
+        # hit-token count. Approximate hit tokens from rate x this prompt's
+        # tokens so the token-weighted metrics still populate. On counter-based
+        # engines cache_hit_tokens is already the exact per-request delta and
+        # this is skipped.
+        if cache_hit_tokens is None and cache_hit_rate is not None and prompt_tokens:
+            cache_hit_tokens = int(round(cache_hit_rate * prompt_tokens))
 
         return CompletionResult(
             content="".join(chunks),
@@ -384,15 +391,16 @@ async def preflight_serving_check(base_url: str, serving_cfg: dict,
 # vLLM and its forks (continuum, infercept) inherit vLLM's counters. The
 # sglang entry is a best-guess metric name — verify with `curl :30000/metrics`.
 CACHE_METRIC_ADAPTERS: dict[str, dict[str, str]] = {
-    "vllm": {"mode": "counter",
-             "queries": "vllm:prefix_cache_queries_total",
-             "hits": "vllm:prefix_cache_hits_total"},
-    "vllm-continuum": {"mode": "counter",
-                       "queries": "vllm:prefix_cache_queries_total",
-                       "hits": "vllm:prefix_cache_hits_total"},
-    "infercept": {"mode": "counter",
-                  "queries": "vllm:prefix_cache_queries_total",
-                  "hits": "vllm:prefix_cache_hits_total"},
+    # vLLM 0.6.x exposes prefix caching as a rolling hit-RATE gauge, not
+    # hit/query counters (verified against a live /metrics on 0.6.6). Read the
+    # gauge directly; the caller derives an approximate hit-token count from
+    # it x prompt_tokens for the token-weighted metrics.
+    "vllm": {"mode": "gauge",
+             "rate": "vllm:gpu_prefix_cache_hit_rate"},
+    "vllm-continuum": {"mode": "gauge",
+                       "rate": "vllm:gpu_prefix_cache_hit_rate"},
+    "infercept": {"mode": "gauge",
+                  "rate": "vllm:gpu_prefix_cache_hit_rate"},
     # UNVERIFIED metric name — confirm on first real SGLang run.
     "sglang": {"mode": "gauge",
                "rate": "sglang:cache_hit_rate"},
