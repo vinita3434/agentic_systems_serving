@@ -196,20 +196,41 @@ def _format_assistant(content: str) -> Message:
 
 async def _summarize_via_llm(llm_client, messages_to_summarize: list[Message]) -> str:
     """Used by the summarization orchestration strategy. Calls the same LLM
-    with a one-shot summarize prompt."""
+    with a one-shot summarize prompt.
+
+    Robustness: the material fed to the summarizer is CAPPED so the summary
+    call itself can't overflow the model's context on a long trajectory (each
+    old message is truncated — tool dumps/file windows are the bloat — and the
+    joined body is bounded). If the call still fails, fall back to a trivial
+    note instead of crashing the episode."""
+    PER_MSG_CHARS = 2000      # per old message (keeps big tool outputs in check)
+    TOTAL_CHARS = 60000       # ~15K tokens of input; leaves headroom under 32K
+    parts = []
+    for m in messages_to_summarize:
+        c = m.get("content", "") or ""
+        if len(c) > PER_MSG_CHARS:
+            c = c[:PER_MSG_CHARS] + f"\n…[truncated {len(c) - PER_MSG_CHARS} chars]"
+        parts.append(f"[{m.get('role')}]\n{c}")
+    body = "\n".join(parts)
+    if len(body) > TOTAL_CHARS:
+        body = "…[older turns truncated]\n" + body[-TOTAL_CHARS:]
+
     prompt = (
         "Summarize the following agent turns in <= 200 words. Preserve file "
         "paths touched, bugs identified, edits made, and test outcomes. "
-        "Omit boilerplate and verbose tool output.\n\n"
+        "Omit boilerplate and verbose tool output.\n\n" + body
     )
-    prompt += "\n".join(f"[{m.get('role')}]\n{m.get('content','')}"
-                        for m in messages_to_summarize)
     summarize_msgs = [
         {"role": "system", "content": "You produce dense agent-trace summaries."},
         {"role": "user", "content": prompt},
     ]
-    result = await llm_client.chat(summarize_msgs, max_tokens=400, temperature=0.0)
-    return result.content
+    try:
+        result = await llm_client.chat(summarize_msgs, max_tokens=400, temperature=0.0)
+        return result.content
+    except httpx.HTTPStatusError:
+        # Even the capped summary was rejected (e.g. context) — never let this
+        # crash the episode; return a minimal placeholder summary.
+        return "[summary unavailable: earlier turns were truncated due to length]"
 
 
 async def run_episode(
