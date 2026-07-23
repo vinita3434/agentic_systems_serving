@@ -190,6 +190,7 @@ class VLLMClient:
         chunks: list[str] = []
         prompt_tokens = 0
         completion_tokens = 0
+        cached_tokens: Optional[int] = None   # exact per-request cache hits
         finish_reason = "stop"
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -218,18 +219,27 @@ class VLLMClient:
                     if usage:
                         prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
                         completion_tokens = usage.get("completion_tokens", completion_tokens)
+                        # Exact cached-prompt-token count, when vLLM is started
+                        # with --enable-prompt-tokens-details.
+                        ptd = usage.get("prompt_tokens_details") or {}
+                        if ptd.get("cached_tokens") is not None:
+                            cached_tokens = ptd["cached_tokens"]
 
         total_ms = (time.perf_counter() - t0) * 1000.0
         if ttft_ms is None:
             ttft_ms = total_ms  # no streamed tokens
 
         cache_hit_tokens, cache_hit_rate = await self._fetch_cache_stats()
-        # Gauge-based engines (vLLM 0.6.x) report only a hit-RATE, no per-request
-        # hit-token count. Approximate hit tokens from rate x this prompt's
-        # tokens so the token-weighted metrics still populate. On counter-based
-        # engines cache_hit_tokens is already the exact per-request delta and
-        # this is skipped.
-        if cache_hit_tokens is None and cache_hit_rate is not None and prompt_tokens:
+        # Prefer the EXACT per-request cache stats from the response usage
+        # (usage.prompt_tokens_details.cached_tokens; needs vLLM
+        # --enable-prompt-tokens-details) — a true per-turn hit-token count and
+        # per-turn rate. Fall back to the /metrics rolling-rate gauge (and its
+        # rate x prompt estimate) only when the exact field is absent.
+        if cached_tokens is not None:
+            cache_hit_tokens = cached_tokens
+            if prompt_tokens:
+                cache_hit_rate = cached_tokens / prompt_tokens
+        elif cache_hit_tokens is None and cache_hit_rate is not None and prompt_tokens:
             cache_hit_tokens = int(round(cache_hit_rate * prompt_tokens))
 
         return CompletionResult(

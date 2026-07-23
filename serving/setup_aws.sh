@@ -125,6 +125,7 @@ START_CMD="$ENV_PREFIX $VENV/bin/vllm serve $MODEL \
   --dtype float16 --gpu-memory-utilization $GPU_MEM_UTIL \
   --max-model-len $MAX_MODEL_LEN --max-num-seqs 64 \
   --enable-prefix-caching --enable-chunked-prefill \
+  --enable-prompt-tokens-details \
   --enable-auto-tool-choice --tool-call-parser hermes"
 echo "CMD: $START_CMD"
 tmux kill-session -t vllm 2>/dev/null || true
